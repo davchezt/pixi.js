@@ -1,0 +1,147 @@
+import { DOMAdapter } from '../../../../environment/adapter';
+import { type ImageLike } from '../../../../environment/ImageLike';
+import { ExtensionType } from '../../../../extensions/Extensions';
+import { ImageSource } from '../../../../rendering/renderers/shared/texture/sources/ImageSource';
+import { GraphicsContext } from '../../../../scene/graphics/shared/GraphicsContext';
+import { getResolutionOfUrl } from '../../../../utils/network/getResolutionOfUrl';
+import { checkDataUrl } from '../../../utils/checkDataUrl';
+import { checkExtension } from '../../../utils/checkExtension';
+import { type LoaderParser, LoaderParserPriority } from '../LoaderParser';
+import { createTexture } from './utils/createTexture';
+
+import type { TextureSourceOptions } from '../../../../rendering/renderers/shared/texture/sources/TextureSource';
+import type { Texture } from '../../../../rendering/renderers/shared/texture/Texture';
+import type { ResolvedAsset } from '../../../types';
+import type { Loader } from '../../Loader';
+
+/**
+ * Configuration for the {@link loadSvg} plugin.
+ * @see loadSvg
+ * @category assets
+ * @advanced
+ */
+export interface LoadSVGConfig
+{
+    /**
+     * The crossOrigin value to use for loading the SVG as an image.
+     * @default 'anonymous'
+     */
+    crossOrigin: ImageLike['crossOrigin'];
+    /**
+     * When set to `true`, loading and decoding images will happen with `new Image()`,
+     * @default false
+     */
+    parseAsGraphicsContext: boolean;
+}
+
+/**
+ * Regular expression for SVG XML document.
+ * @example &lt;?xml version="1.0" encoding="utf-8" ?&gt;&lt;!-- image/svg --&gt;&lt;svg
+ * @readonly
+ */
+const validSVGExtension = '.svg';
+const validSVGMIME = 'image/svg+xml';
+
+/**
+ * A loader plugin for loading SVG data as textures or graphics contexts.
+ * @category assets
+ * @advanced
+ */
+export const loadSvg: LoaderParser<Texture | GraphicsContext, TextureSourceOptions & LoadSVGConfig, LoadSVGConfig> = {
+    extension: {
+        type: ExtensionType.LoadParser,
+        priority: LoaderParserPriority.Low,
+        name: 'loadSVG',
+    },
+
+    /** used for deprecation purposes */
+    name: 'loadSVG',
+    id: 'svg',
+
+    config: {
+        crossOrigin: 'anonymous',
+        parseAsGraphicsContext: false,
+    },
+
+    test(url: string): boolean
+    {
+        return checkDataUrl(url, validSVGMIME) || checkExtension(url, validSVGExtension);
+    },
+
+    async load(
+        url: string,
+        asset: ResolvedAsset<TextureSourceOptions & LoadSVGConfig>,
+        loader: Loader
+    ): Promise<Texture | GraphicsContext>
+    {
+        if (asset.data?.parseAsGraphicsContext ?? this.config.parseAsGraphicsContext)
+        {
+            return loadAsGraphics(url);
+        }
+
+        return loadAsTexture(url, asset, loader, this.config.crossOrigin);
+    },
+
+    unload(asset: Texture | GraphicsContext): void
+    {
+        asset.destroy(true);
+    }
+
+};
+
+async function loadAsTexture(
+    url: string,
+    asset: ResolvedAsset<TextureSourceOptions & LoadSVGConfig>,
+    loader: Loader,
+    crossOrigin: ImageLike['crossOrigin']
+): Promise<Texture>
+{
+    const response = await DOMAdapter.get().fetch(url);
+
+    const image = DOMAdapter.get().createImage();
+
+    image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(await response.text())}`;
+    image.crossOrigin = crossOrigin;
+    await image.decode();
+
+    // convert to canvas...
+    const width = asset.data?.width ?? image.width;
+    const height = asset.data?.height ?? image.height;
+    const resolution = asset.data?.resolution || getResolutionOfUrl(url);
+
+    // Ensure canvas dimensions are integers to prevent edge trimming
+    const canvasWidth = Math.ceil(width * resolution);
+    const canvasHeight = Math.ceil(height * resolution);
+
+    const canvas = DOMAdapter.get().createCanvas(canvasWidth, canvasHeight);
+    const context = canvas.getContext('2d');
+
+    // Improve rendering quality for decimal resolutions
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+
+    // Draw image with exact scaled dimensions to prevent trimming
+    context.drawImage(image as CanvasImageSource, 0, 0, width * resolution, height * resolution);
+
+    const { parseAsGraphicsContext: _p, ...rest } = asset.data ?? {};
+    const base = new ImageSource({
+        resource: canvas,
+        alphaMode: 'premultiply-alpha-on-upload',
+        resolution,
+        ...rest,
+    });
+
+    return createTexture(base, loader, url);
+}
+
+async function loadAsGraphics(url: string): Promise<GraphicsContext>
+{
+    const response = await DOMAdapter.get().fetch(url);
+    const svgSource = await response.text();
+
+    const context = new GraphicsContext();
+
+    context.svg(svgSource);
+
+    return context;
+}

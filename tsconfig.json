@@ -1,8 +1,9 @@
 {
     "compilerOptions": {
-        "target": "es5",
+        "target": "es2020",
+        "lib": ["ESNext", "DOM", "WebWorker", "DOM.Iterable"],
+        "module": "ESNext",
         "allowJs": false,
-        "sourceMap": true,
         "removeComments": false,
         "strict": true,
         "noImplicitAny": true,
@@ -11,39 +12,23 @@
         "noImplicitReturns": true,
         "strictNullChecks": false,
         "allowSyntheticDefaultImports": true,
-        "moduleResolution": "node",
+        "moduleResolution": "bundler",
         "resolveJsonModule": true,
-        "baseUrl": "./",
+        "skipDefaultLibCheck": true,
+        "forceConsistentCasingInFileNames": true,
+        "types": ["node"],
         "paths": {
-            "@pixi/*": [
-                "packages/*/src",
-                "packages/filters/*/src",
-                "packages/canvas/*/src"
-            ],
-            "pixi.js": [
-                "bundles/pixi.js/src"
-            ],
-            "pixi.js-legacy": [
-                "bundles/pixi.js-legacy/src"
-            ]
+            "~/*": ["./src/*"],
+            "@test-utils": ["./tests/utils/index.ts"],
+            "pixi.js": ["./src/index.ts"],
+            "pixi.js/*": ["./src/*"]
         },
-        "outDir": "./out",
-        "declaration": true
+        "rewriteRelativeImportExtensions": true
     },
     "exclude": [
         "node_modules",
         "**/dist/**",
         "**/lib/**",
-        "**/test/**",
-        "**/scripts/**",
-        "**/types/**",
-        "bundles/**/*.d.ts",
-        "rollup.config.js"
-    ],
-    "ts-node": {
-        "files": true,
-        "compilerOptions": {
-            "esModuleInterop": true
-        }
-    }
+        "**/out/**"
+    ]
 }

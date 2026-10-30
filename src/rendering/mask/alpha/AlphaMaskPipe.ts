@@ -1,0 +1,319 @@
+import { ExtensionType } from '../../../extensions/Extensions';
+import { FilterEffect } from '../../../filters/FilterEffect';
+import { MaskFilter } from '../../../filters/mask/MaskFilter';
+import { Bounds } from '../../../scene/container/bounds/Bounds';
+import { getGlobalBounds } from '../../../scene/container/bounds/getGlobalBounds';
+import { Sprite } from '../../../scene/sprite/Sprite';
+import { BigPool } from '../../../utils/pool/PoolGroup';
+import { Texture } from '../../renderers/shared/texture/Texture';
+import { TexturePool } from '../../renderers/shared/texture/TexturePool';
+import { RendererType } from '../../renderers/types';
+
+import type { MaskChannel } from '../../../filters/mask/MaskFilter';
+import type { Container } from '../../../scene/container/Container';
+import type { Effect } from '../../../scene/container/Effect';
+import type { PoolItem } from '../../../utils/pool/Pool';
+import type { Instruction } from '../../renderers/shared/instructions/Instruction';
+import type { InstructionSet } from '../../renderers/shared/instructions/InstructionSet';
+import type { InstructionPipe } from '../../renderers/shared/instructions/RenderPipe';
+import type { RenderTarget } from '../../renderers/shared/renderTarget/RenderTarget';
+import type { Renderer } from '../../renderers/types';
+import type { AlphaMask } from './AlphaMask';
+
+type MaskMode = 'pushMaskBegin' | 'pushMaskEnd' | 'popMaskBegin' | 'popMaskEnd';
+
+const tempBounds = new Bounds();
+
+/** @internal */
+class AlphaMaskEffect extends FilterEffect implements PoolItem
+{
+    /** the sprite the pooled filter is parked on between uses */
+    private readonly _placeholderSprite = new Sprite(Texture.EMPTY);
+
+    constructor()
+    {
+        super();
+
+        this.filters = [new MaskFilter({
+            sprite: this._placeholderSprite,
+            inverse: false,
+            resolution: 'inherit',
+            antialias: 'inherit'
+        })];
+    }
+
+    get sprite(): Sprite
+    {
+        return (this.filters[0] as MaskFilter).sprite;
+    }
+
+    set sprite(value: Sprite)
+    {
+        (this.filters[0] as MaskFilter).setSprite(value);
+    }
+
+    get inverse(): boolean
+    {
+        return (this.filters[0] as MaskFilter).inverse;
+    }
+
+    set inverse(value: boolean)
+    {
+        (this.filters[0] as MaskFilter).inverse = value;
+    }
+
+    get channel(): MaskChannel
+    {
+        return (this.filters[0] as MaskFilter).channel;
+    }
+
+    set channel(value: MaskChannel)
+    {
+        (this.filters[0] as MaskFilter).channel = value;
+    }
+
+    /**
+     * Called by {@link BigPool} when the pipe returns the effect: parks the filter
+     * on the empty placeholder so a pooled effect keeps no bindings to the last
+     * mask it applied. Without this, the pooled filter pins the mask sprite and
+     * its texture for as long as the effect sits in the pool, and destroying that
+     * texture's source hits a bind group subscription the user cannot release.
+     */
+    public reset(): void
+    {
+        this._placeholderSprite.texture = Texture.EMPTY;
+        this.sprite = this._placeholderSprite;
+    }
+
+    public init: () => void;
+}
+
+/** @internal */
+export interface AlphaMaskInstruction extends Instruction
+{
+    renderPipeId: 'alphaMask',
+    action: MaskMode,
+    mask: AlphaMask,
+    inverse: boolean;
+    maskedContainer: Container,
+    renderMask: boolean,
+}
+
+/** @internal */
+export interface AlphaMaskData
+{
+    filterEffect: AlphaMaskEffect,
+    maskedContainer: Container,
+    previousRenderTarget?: RenderTarget,
+    filterTexture?: Texture,
+}
+
+/** @internal */
+export class AlphaMaskPipe implements InstructionPipe<AlphaMaskInstruction>
+{
+    /** @ignore */
+    public static extension = {
+        type: [
+            ExtensionType.WebGLPipes,
+            ExtensionType.WebGPUPipes,
+            ExtensionType.CanvasPipes,
+        ],
+        name: 'alphaMask',
+    } as const;
+
+    private _renderer: Renderer;
+    private _activeMaskStage: AlphaMaskData[] = [];
+    private _usedEffects: AlphaMaskEffect[] = [];
+
+    constructor(renderer: Renderer)
+    {
+        this._renderer = renderer;
+
+        renderer.runners.postrender.add(this);
+    }
+
+    public push(mask: Effect, maskedContainer: Container, instructionSet: InstructionSet): void
+    {
+        const renderer = this._renderer;
+
+        renderer.renderPipes.batch.break(instructionSet);
+
+        instructionSet.add({
+            renderPipeId: 'alphaMask',
+            action: 'pushMaskBegin',
+            mask,
+            inverse: maskedContainer._maskOptions.inverse,
+            canBundle: false,
+            maskedContainer
+        } as AlphaMaskInstruction);
+
+        (mask as AlphaMask).inverse = maskedContainer._maskOptions.inverse;
+        (mask as AlphaMask).channel = maskedContainer._maskOptions.channel ?? 'red';
+
+        if ((mask as AlphaMask).renderMaskToTexture)
+        {
+            const maskContainer = (mask as AlphaMask).mask;
+
+            maskContainer.includeInBuild = true;
+
+            maskContainer.collectRenderables(
+                instructionSet,
+                renderer,
+                null
+            );
+
+            maskContainer.includeInBuild = false;
+        }
+
+        renderer.renderPipes.batch.break(instructionSet);
+
+        instructionSet.add({
+            renderPipeId: 'alphaMask',
+            action: 'pushMaskEnd',
+            mask,
+            maskedContainer,
+            inverse: maskedContainer._maskOptions.inverse,
+            canBundle: false,
+        } as AlphaMaskInstruction);
+    }
+
+    public pop(mask: Effect, _maskedContainer: Container, instructionSet: InstructionSet): void
+    {
+        const renderer = this._renderer;
+
+        renderer.renderPipes.batch.break(instructionSet);
+
+        instructionSet.add({
+            renderPipeId: 'alphaMask',
+            action: 'popMaskEnd',
+            mask,
+            inverse: _maskedContainer._maskOptions.inverse,
+            canBundle: false,
+        } as AlphaMaskInstruction);
+    }
+
+    public execute(instruction: AlphaMaskInstruction)
+    {
+        const renderer = this._renderer;
+        const renderMask = instruction.mask.renderMaskToTexture;
+
+        if (instruction.action === 'pushMaskBegin')
+        {
+            const filterEffect = BigPool.get(AlphaMaskEffect);
+
+            filterEffect.inverse = instruction.inverse;
+            filterEffect.channel = instruction.mask.channel;
+
+            if (renderMask)
+            {
+                instruction.mask.mask.measurable = true;
+
+                const bounds = getGlobalBounds(instruction.mask.mask, true, tempBounds);
+
+                instruction.mask.mask.measurable = false;
+
+                bounds.ceil();
+
+                const colorTextureSource = renderer.renderTarget.renderTarget.colorTexture.source;
+                const filterTexture = TexturePool.getOptimalTexture({
+                    width: bounds.width,
+                    height: bounds.height,
+                    resolution: colorTextureSource._resolution,
+                    antialias: colorTextureSource.antialias,
+                });
+
+                renderer.renderTarget.push({ target: filterTexture, clear: true });
+
+                renderer.globalUniforms.push({
+                    offset: bounds,
+                    worldColor: 0xFFFFFFFF
+                });
+
+                const sprite = filterEffect.sprite;
+
+                sprite.texture = filterTexture;
+
+                sprite.worldTransform.tx = bounds.minX;
+                sprite.worldTransform.ty = bounds.minY;
+
+                this._activeMaskStage.push({
+                    filterEffect,
+                    maskedContainer: instruction.maskedContainer,
+                    filterTexture,
+                });
+            }
+            else
+            {
+                filterEffect.sprite = instruction.mask.mask as Sprite;
+
+                this._activeMaskStage.push({
+                    filterEffect,
+                    maskedContainer: instruction.maskedContainer,
+                });
+            }
+        }
+        else if (instruction.action === 'pushMaskEnd')
+        {
+            const maskData = this._activeMaskStage[this._activeMaskStage.length - 1];
+
+            if (renderMask)
+            {
+                // WebGPU blit's automatically, but WebGL does not!
+                if (renderer.type === RendererType.WEBGL)
+                {
+                    renderer.renderTarget.finishRenderPass();
+                }
+
+                renderer.renderTarget.pop();
+                renderer.globalUniforms.pop();
+            }
+
+            renderer.filter.push({
+                renderPipeId: 'filter',
+                action: 'pushFilter',
+                container: maskData.maskedContainer,
+                filterEffect: maskData.filterEffect,
+                canBundle: false,
+            });
+        }
+        else if (instruction.action === 'popMaskEnd')
+        {
+            renderer.filter.pop();
+
+            const maskData = this._activeMaskStage.pop();
+
+            if (renderMask)
+            {
+                TexturePool.returnTexture(maskData.filterTexture);
+            }
+
+            // Returning the effect to the pool now would let the next mask in this frame
+            // reuse it, along with its MaskFilter's uniform buffer. WebGPU only reads that
+            // buffer when the frame's commands are submitted, so sharing it between masks
+            // would make every mask sample the last-written filter matrix (#12145).
+            this._usedEffects.push(maskData.filterEffect);
+        }
+    }
+
+    public postrender(): void
+    {
+        const effects = this._usedEffects;
+
+        for (let i = 0; i < effects.length; i++)
+        {
+            BigPool.return(effects[i]);
+        }
+
+        effects.length = 0;
+    }
+
+    public destroy(): void
+    {
+        this.postrender();
+
+        this._renderer.runners.postrender.remove(this);
+        this._renderer = null;
+        this._activeMaskStage = null;
+        this._usedEffects = null;
+    }
+}

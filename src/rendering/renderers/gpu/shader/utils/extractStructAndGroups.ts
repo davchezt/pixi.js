@@ -1,0 +1,117 @@
+/**
+ * The access mode for a buffer binding in WGSL
+ * @category rendering
+ * @advanced
+ */
+export type WgslAccessMode = 'uniform' | 'storage' | undefined;
+
+/**
+ * Defines the structure of the extracted WGSL structs and groups.
+ * @category rendering
+ * @advanced
+ */
+export interface StructsAndGroups
+{
+    groups: {
+        group: number;
+        binding: number;
+        name: string;
+        /** The access mode for buffer bindings: 'uniform', 'storage', or undefined for textures/samplers */
+        accessMode: WgslAccessMode;
+        type: string;
+    }[];
+    structs: {
+        name: string;
+        members: Record<string, string>;
+    }[];
+}
+
+/**
+ * Parses a WGSL shader source and extracts its `@group`/`@binding` declarations and the
+ * structs they reference. The result feeds {@link generateGpuLayoutGroups} to build a
+ * WebGPU bind group layout.
+ * @param wgsl - The WGSL shader source to parse.
+ * @returns The structs and `@group`/`@binding` groups found in the source.
+ * @category rendering
+ * @advanced
+ */
+export function extractStructAndGroups(wgsl: string): StructsAndGroups
+{
+    // Patterns for parsing the WGSL file
+    const linePattern = /(^|[^/])@(group|binding)\(\d+\)[^;]+;/g;
+    const groupPattern = /@group\((\d+)\)/;
+    const bindingPattern = /@binding\((\d+)\)/;
+    const namePattern = /var(<[^>]+>)? (\w+)/;
+    const typePattern = /:\s*([\w<>]+)/;
+    const structPattern = /struct\s+(\w+)\s*{([^}]+)}/g;
+    const structMemberPattern = /(\w+)\s*:\s*([\w\<\>]+)/g;
+    const structName = /struct\s+(\w+)/;
+    // Find the @group and @binding annotations
+    const groups = wgsl.match(linePattern)?.map((item) =>
+    {
+        const varMatch = item.match(namePattern);
+        const varQualifier = varMatch?.[1] ?? '';
+
+        // Determine access mode from var qualifier
+        let accessMode: WgslAccessMode;
+
+        if (varQualifier === '<uniform>')
+        {
+            accessMode = 'uniform';
+        }
+        else if (varQualifier.startsWith('<storage'))
+        {
+            accessMode = 'storage';
+        }
+
+        return {
+            group: parseInt(item.match(groupPattern)[1], 10),
+            binding: parseInt(item.match(bindingPattern)[1], 10),
+            name: varMatch[2],
+            accessMode,
+            type: item.match(typePattern)[1],
+        };
+    });
+
+    if (!groups)
+    {
+        return {
+            groups: [],
+            structs: [],
+        };
+    }
+
+    // Find the structs
+    const structs = wgsl
+        .match(structPattern)
+        ?.map((struct) =>
+        {
+            const name = struct.match(structName)[1];
+            const members = struct.match(structMemberPattern).reduce((acc: Record<string, string>, member) =>
+            {
+                const [name, type] = member.split(':');
+
+                acc[name.trim()] = type.trim();
+
+                return acc;
+            }, {});
+
+            if (!members)
+            {
+                return null;
+            }
+
+            return { name, members };
+            // Only include the structs mentioned in the @group/@binding annotations
+        })
+        .filter(({ name }) => groups.some((group) =>
+
+            // Handle both direct type matches and generic types like array<StructName>
+            group.type === name || group.type.includes(`<${name}>`)
+        )) ?? [];
+
+    return {
+        groups,
+        structs,
+    };
+}

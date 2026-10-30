@@ -1,0 +1,392 @@
+import EventEmitter from 'eventemitter3';
+import { Bounds } from '../../../../scene/container/bounds/Bounds';
+import { uid } from '../../../../utils/data/uid';
+import { deprecation } from '../../../../utils/logging/deprecation';
+import { type GlGeometryGpuData } from '../../gl/geometry/GlGeometrySystem';
+import { type GPUDataOwner } from '../../types';
+import { Buffer } from '../buffer/Buffer';
+import { type GCable, type GCData } from '../GCSystem';
+import { ensureIsBuffer } from './utils/ensureIsBuffer';
+import { getGeometryBounds } from './utils/getGeometryBounds';
+
+import type { TypedArray } from '../buffer/Buffer';
+import type { Topology, VertexFormat } from './const';
+
+/**
+ * The index buffer array type used in geometries.
+ * @category rendering
+ * @advanced
+ */
+export type IndexBufferArray = Uint16Array | Uint32Array;
+
+/**
+ * The attribute data for a geometries attributes
+ * @category rendering
+ * @advanced
+ */
+export interface Attribute
+{
+    /** the buffer that this attributes data belongs to */
+    buffer: Buffer;
+    /** the format of the attribute */
+    format?: VertexFormat;
+    /** the stride of the data in the buffer - in bytes*/
+    stride?: number;
+    /** the offset of the attribute from the buffer, defaults to 0 - in bytes*/
+    offset?: number;
+    /** is this an instanced buffer? (defaults to false) */
+    instance?: boolean;
+    /** the number of elements to be rendered. If not specified, all vertices after the starting vertex will be drawn. */
+    size?: number;
+    /**
+     * the starting vertex in the geometry to start drawing from. If not specified,
+     *  drawing will start from the first vertex.
+     */
+    start?: number;
+    /**
+     * attribute divisor for instanced rendering. Note: this is a **WebGL-only** feature, the WebGPU renderer will
+     * issue a warning if one of the attributes has divisor set.
+     */
+    divisor?: number;
+}
+
+/**
+ * The attribute option used by the constructor for adding geometries attributes
+ * extends {@link Attribute} but allows for the buffer to be a typed or number array
+ * @category rendering
+ * @advanced
+ */
+export type AttributeOption = Omit<Attribute, 'buffer'> & { buffer: Buffer | TypedArray | number[]}
+| Buffer | TypedArray | number[];
+
+/**
+ * The attribute options used by the constructor for adding geometries attributes
+ * extends {@link Attribute} but allows for the buffer to be a typed or number array
+ * @category rendering
+ * @advanced
+ */
+export type AttributeOptions = Record<string, AttributeOption>;
+
+/**
+ * the interface that describes the structure of the geometry
+ * @category rendering
+ * @advanced
+ */
+export interface GeometryDescriptor
+{
+    /** an optional label to easily identify the geometry */
+    label?: string;
+    /** the attributes that make up the geometry */
+    attributes?: AttributeOptions;
+    /** optional index buffer for this geometry */
+    indexBuffer?: Buffer | TypedArray | number[];
+    /** the topology of the geometry, defaults to 'triangle-list' */
+    topology?: Topology;
+
+    /** the number of instances to draw, defaults to 1. See {@link Geometry.instanceCount} */
+    instanceCount?: number;
+    /** the number of indices to draw, defaults to 0 - the whole index buffer. See {@link Geometry.indexCount} */
+    indexCount?: number;
+}
+function ensureIsAttribute(attribute: AttributeOption): Attribute
+{
+    if (attribute instanceof Buffer || Array.isArray(attribute) || (attribute as TypedArray).BYTES_PER_ELEMENT)
+    {
+        attribute = {
+            buffer: attribute as Buffer | TypedArray | number[],
+        };
+    }
+
+    (attribute as Attribute).buffer = ensureIsBuffer(attribute.buffer as Buffer | TypedArray | number[], false);
+
+    return attribute as Attribute;
+}
+
+/**
+ * A Geometry is a low-level object that represents the structure of 2D shapes in terms of vertices and attributes.
+ * It's a crucial component for rendering as it describes the shape and format of the data that will go through the shaders.
+ * Essentially, a Geometry object holds the data you'd send to a GPU buffer.
+ *
+ * A geometry is basically made of two components:
+ * <br>
+ * <b>Attributes</b>: These are essentially arrays that define properties of the vertices like position, color,
+ * texture coordinates, etc. They map directly to attributes in your vertex shaders.
+ * <br>
+ * <b>Indices</b>: An optional array that describes how the vertices are connected.
+ * If not provided, vertices will be interpreted in the sequence they're given.
+ * @example
+ *
+ * const geometry = new Geometry({
+ *   attributes: {
+ *     aPosition: [ // add some positions
+ *       0, 0,
+ *       0, 100,
+ *       100, 100,
+ *       100,   0,
+ *     ],
+ *     aUv: [ // add some uvs
+ *       0, 0,
+ *       0, 1,
+ *       1, 1,
+ *       1, 0,
+ *     ]
+ *   }
+ * });
+ * @category rendering
+ * @advanced
+ */
+export class Geometry extends EventEmitter<{
+    update: Geometry,
+    destroy: Geometry,
+    unload: Geometry,
+}> implements GPUDataOwner, GCable
+{
+    /** @internal */
+    public _gpuData: Record<number, GlGeometryGpuData> = Object.create(null);
+    /** @internal */
+    public _gcData?: GCData;
+    /** If set to true, the resource will be garbage collected automatically when it is not used. */
+    public autoGarbageCollect = true;
+    /** @internal */
+    public _gcLastUsed = -1;
+
+    /** The topology of the geometry. */
+    public topology: Topology;
+    /** The unique id of the geometry. */
+    public readonly uid: number = uid('geometry');
+    /** A record of the attributes of the geometry. */
+    public readonly attributes: Record<string, Attribute>;
+    /** The buffers that the attributes use */
+    public readonly buffers: Buffer[];
+    /** The index buffer of the geometry */
+    public indexBuffer: Buffer;
+
+    /**
+     * the layout key will be generated by WebGPU all geometries that have the same structure
+     * will have the same layout key. This is used to cache the pipeline layout
+     * @internal
+     */
+    public _layoutKey = 0;
+
+    /** the instance count of the geometry to draw */
+    public instanceCount = 1;
+
+    /**
+     * The number of indices to draw, or `0` to draw the whole index buffer.
+     *
+     * Set this when a geometry only covers a prefix of an index buffer it shares with others - a
+     * pool of identical quads, say, where one buffer holds the six indices per quad for the largest
+     * batch and each geometry draws as many quads as it currently holds. A `size` passed to the
+     * draw call still wins, and a geometry with no index buffer ignores this entirely
+     * ({@link Geometry.vertexCount} drives those). Read at draw time only, so changing it never
+     * re-uploads or re-lays-out anything.
+     * @default 0
+     */
+    public indexCount = 0;
+
+    private readonly _bounds: Bounds = new Bounds();
+    private _boundsDirty = true;
+
+    private _vertexCount = 0;
+    private _vertexCountDirty = true;
+
+    /**
+     * Create a new instance of a geometry
+     * @param options - The options for the geometry.
+     */
+    constructor(options: GeometryDescriptor = {})
+    {
+        super();
+
+        const { attributes, indexBuffer, topology } = options;
+
+        this.buffers = [];
+
+        this.attributes = {};
+
+        if (attributes)
+        {
+            for (const i in attributes)
+            {
+                this.addAttribute(i, attributes[i]);
+            }
+        }
+
+        this.instanceCount = options.instanceCount ?? 1;
+        this.indexCount = options.indexCount ?? 0;
+
+        if (indexBuffer)
+        {
+            this.addIndex(indexBuffer);
+        }
+
+        this.topology = topology || 'triangle-list';
+    }
+
+    protected onBufferUpdate(): void
+    {
+        this._boundsDirty = true;
+        this._vertexCountDirty = true;
+        this.emit('update', this);
+    }
+
+    /**
+     * Returns the requested attribute.
+     * @param id - The name of the attribute required
+     * @returns - The attribute requested.
+     */
+    public getAttribute(id: string): Attribute
+    {
+        return this.attributes[id];
+    }
+
+    /**
+     * Returns the index buffer
+     * @returns - The index buffer.
+     */
+    public getIndex(): Buffer
+    {
+        return this.indexBuffer;
+    }
+
+    /**
+     * Returns the requested buffer.
+     * @param id - The name of the buffer required.
+     * @returns - The buffer requested.
+     */
+    public getBuffer(id: string): Buffer
+    {
+        return this.getAttribute(id).buffer;
+    }
+
+    /**
+     * The number of vertices in this geometry, derived from the first non-instanced attribute.
+     * The value is cached and only recalculated when the geometry's buffers or attributes change.
+     */
+    get vertexCount(): number
+    {
+        if (!this._vertexCountDirty) return this._vertexCount;
+
+        this._vertexCountDirty = false;
+
+        const attributes = this.attributes;
+
+        for (const i in attributes)
+        {
+            const attribute = attributes[i];
+
+            if (attribute.instance) continue;
+
+            const buffer = attribute.buffer;
+
+            this._vertexCount = (buffer.data as TypedArray).length / ((attribute.stride / 4) || attribute.size);
+
+            return this._vertexCount;
+        }
+
+        this._vertexCount = 0;
+
+        return 0;
+    }
+
+    /**
+     * Used to figure out how many vertices there are in this geometry
+     * @returns the number of vertices in the geometry
+     * @deprecated since 8.20.0, use {@link Geometry.vertexCount} instead
+     */
+    public getSize(): number
+    {
+        // #if _DEBUG
+        deprecation('8.20.0', 'Geometry.getSize is deprecated, please use Geometry.vertexCount instead.');
+        // #endif
+
+        return this.vertexCount;
+    }
+
+    /**
+     * Adds an attribute to the geometry.
+     * @param name - The name of the attribute to add.
+     * @param attributeOption - The attribute option to add.
+     */
+    public addAttribute(name: string, attributeOption: AttributeOption): void
+    {
+        const attribute = ensureIsAttribute(attributeOption);
+
+        const bufferIndex = this.buffers.indexOf(attribute.buffer);
+
+        if (bufferIndex === -1)
+        {
+            this.buffers.push(attribute.buffer);
+
+            // two events here - one for a resize (new buffer change)
+            // and one for an update (existing buffer change)
+            attribute.buffer.on('update', this.onBufferUpdate, this);
+            attribute.buffer.on('change', this.onBufferUpdate, this);
+        }
+        this.attributes[name] = attribute;
+
+        this._vertexCountDirty = true;
+    }
+
+    /**
+     * Adds an index buffer to the geometry.
+     * @param indexBuffer - The index buffer to add. Can be a Buffer, TypedArray, or an array of numbers.
+     */
+    public addIndex(indexBuffer: Buffer | TypedArray | number[]): void
+    {
+        this.indexBuffer = ensureIsBuffer(indexBuffer, true);
+        this.buffers.push(this.indexBuffer);
+    }
+
+    /** Returns the bounds of the geometry. */
+    get bounds(): Bounds
+    {
+        if (!this._boundsDirty) return this._bounds;
+
+        this._boundsDirty = false;
+
+        return getGeometryBounds(this, 'aPosition', this._bounds);
+    }
+
+    /** Unloads the geometry from the GPU. */
+    public unload(): void
+    {
+        /** Unloads the GPU data from the view container. */
+        this.emit('unload', this);
+        for (const key in this._gpuData)
+        {
+            this._gpuData[key]?.destroy();
+        }
+        this._gpuData = Object.create(null);
+    }
+
+    /**
+     * destroys the geometry.
+     * @param destroyBuffers - destroy the buffers associated with this geometry
+     */
+    public destroy(destroyBuffers = false): void
+    {
+        this.emit('destroy', this);
+
+        // a buffer that outlives the geometry (shared, or destroyBuffers false) must not
+        // keep retaining and calling into it
+        for (const buffer of this.buffers)
+        {
+            buffer.off('update', this.onBufferUpdate, this);
+            buffer.off('change', this.onBufferUpdate, this);
+
+            if (destroyBuffers) buffer.destroy();
+        }
+
+        this.unload();
+
+        // must come after unload() - the renderer geometry systems listen for 'unload'
+        // to delete their VAOs and release their managed-hash entry
+        this.removeAllListeners();
+
+        (this.attributes as null) = null;
+        (this.buffers as null) = null;
+        (this.indexBuffer as null) = null;
+        (this._bounds as null) = null;
+    }
+}

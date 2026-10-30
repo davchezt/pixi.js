@@ -1,0 +1,766 @@
+import { warn } from '../../../../utils/logging/warn';
+import { CLEAR } from '../../gl/const';
+import { CanvasSource } from '../../shared/texture/sources/CanvasSource';
+import { TextureSource } from '../../shared/texture/sources/TextureSource';
+import { GpuDepthCopy } from './GpuDepthCopy';
+import { GpuMsaaRestore } from './GpuMsaaRestore';
+import { GpuRenderTarget } from './GpuRenderTarget';
+
+import type { RgbaArray } from '../../../../color/Color';
+import type { Rectangle } from '../../../../maths/shapes/Rectangle';
+import type { CLEAR_OR_BOOL } from '../../gl/const';
+import type { RenderTarget } from '../../shared/renderTarget/RenderTarget';
+import type { RenderTargetAdaptor, RenderTargetSystem } from '../../shared/renderTarget/RenderTargetSystem';
+import type { Texture } from '../../shared/texture/Texture';
+import type { WebGPURenderer } from '../WebGPURenderer';
+
+// WebGPU's `GPUCanvasContext.configure` only accepts these formats. Anything else on a
+// CanvasSource falls back to the platform-preferred format with a warning.
+const canvasAllowedFormats: Record<string, true> = {
+    bgra8unorm: true,
+    rgba8unorm: true,
+    rgba16float: true,
+};
+
+function getCanvasContextFormat(format: GPUTextureFormat): GPUTextureFormat
+{
+    if (canvasAllowedFormats[format]) return format;
+
+    const preferred = navigator.gpu.getPreferredCanvasFormat();
+
+    warn(`[WebGPU] CanvasSource format '${format}' is not a valid GPUCanvasContext format. `
+        + `Falling back to '${preferred}'. Allowed formats are: bgra8unorm, rgba8unorm, rgba16float.`);
+
+    return preferred;
+}
+
+/**
+ * The WebGPU adaptor for the render target system. Allows the Render Target System to
+ * be used with the WebGPU renderer
+ * @category rendering
+ * @ignore
+ */
+export class GpuRenderTargetAdaptor implements RenderTargetAdaptor<GpuRenderTarget>
+{
+    private _renderTargetSystem: RenderTargetSystem<GpuRenderTarget>;
+    private _renderer: WebGPURenderer<HTMLCanvasElement>;
+    /**
+     * The render target the currently open render pass is rendering to (plus the subresource it is
+     * bound to). Used to make {@link startRenderPass} idempotent: binding the same target/mip/layer
+     * again with no clear reuses the open pass instead of tearing it down and beginning a new one.
+     * Reset to `null` whenever the pass is closed ({@link finishRenderPass}).
+     */
+    private _activePass: {
+        renderTarget: RenderTarget;
+        mipLevel: number;
+        layer: number;
+        depthStencil: boolean;
+    } | null = null;
+
+    /** Restores discarded MSAA colour buffers on reopen. Created on first use, per device. */
+    private _msaaRestore: GpuMsaaRestore;
+    /** Draws the depth copies `copyTextureToTexture` can't make. Created on first use, per device. */
+    private _depthCopy: GpuDepthCopy;
+
+    public init(renderer: WebGPURenderer, renderTargetSystem: RenderTargetSystem<GpuRenderTarget>): void
+    {
+        this._renderer = renderer;
+        this._renderTargetSystem = renderTargetSystem;
+
+        renderer.runners.contextChange.add(this);
+        renderer.runners.destroy.add(this);
+    }
+
+    /** Drops the MSAA helpers, whose pipelines belong to the old device. The next use makes new ones. */
+    public contextChange(): void
+    {
+        this._msaaRestore = null;
+        this._depthCopy = null;
+    }
+
+    public destroy(): void
+    {
+        this._msaaRestore = null;
+        this._depthCopy = null;
+    }
+
+    public copyToTexture(
+        sourceRenderSurfaceTexture: RenderTarget,
+        destinationTexture: Texture,
+        originSrc: { x: number; y: number; },
+        size: { width: number; height: number; },
+        originDest: { x: number; y: number; },
+    )
+    {
+        const renderer = this._renderer;
+
+        // a copy cannot be recorded while a render pass holds the shared command encoder —
+        // close the pass first (no-op when none is open), matching the GL adaptor
+        this.finishRenderPass();
+
+        const baseGpuTexture = this._getGpuColorTexture(
+            sourceRenderSurfaceTexture
+        );
+
+        const backGpuTexture = renderer.texture.getGpuSource(
+            destinationTexture.source
+        );
+
+        renderer.encoder.commandEncoder.copyTextureToTexture(
+            {
+                texture: baseGpuTexture,
+                origin: originSrc,
+            },
+            {
+                texture: backGpuTexture,
+                origin: originDest,
+            },
+            size
+        );
+
+        return destinationTexture;
+    }
+
+    public copyDepthTexture(
+        source: RenderTarget,
+        destination: Texture,
+        originSrc: { x: number; y: number; },
+        size: { width: number; height: number; },
+        originDest: { x: number; y: number; },
+    ): void
+    {
+        const renderer = this._renderer;
+
+        // a copy cannot be recorded while a render pass holds the shared command encoder —
+        // close the pass first (no-op when none is open), matching the GL adaptor
+        this.finishRenderPass();
+
+        const srcDepth = source.depthStencilAttachment.texture;
+        const dstDepth = destination.source;
+        const srcGpu = renderer.texture.getGpuSource(srcDepth);
+        const dstGpu = renderer.texture.getGpuSource(dstDepth);
+
+        // copyTextureToTexture only copies a depth texture whole, into one of the same size and sample count;
+        // anything else is drawn
+        const drawn = srcGpu.sampleCount > 1
+            || originSrc.x !== 0 || originSrc.y !== 0 || originDest.x !== 0 || originDest.y !== 0
+            || size.width !== srcGpu.width || size.height !== srcGpu.height
+            || size.width !== dstGpu.width || size.height !== dstGpu.height;
+
+        if (drawn)
+        {
+            if (srcDepth.transient)
+            {
+                warn('[RenderTargetSystem] copyDepthTexture: the source target is transient, so its '
+                    + 'multisampled depth is discarded at the end of each pass and there is nothing to copy');
+
+                return;
+            }
+
+            if (!srcDepth.format.includes('depth') || !dstDepth.format.includes('depth'))
+            {
+                warn('[RenderTargetSystem] copyDepthTexture: copying from an antialiased target or a region copies '
+                    + `depth only, so both textures need a depth aspect (got '${srcDepth.format}' to '${dstDepth.format}')`);
+
+                return;
+            }
+        }
+
+        const standAlone = renderer.encoder.commandEncoder === null;
+        const commandEncoder = standAlone
+            ? renderer.gpu.device.createCommandEncoder()
+            : renderer.encoder.commandEncoder;
+
+        if (drawn)
+        {
+            this._depthCopy ??= new GpuDepthCopy(renderer);
+            this._depthCopy.copy(commandEncoder, srcDepth, dstDepth, originSrc, size, originDest);
+        }
+        else
+        {
+            // a whole depth texture copies straight into the destination's source
+            commandEncoder.copyTextureToTexture({ texture: srcGpu }, { texture: dstGpu }, size);
+        }
+
+        if (standAlone)
+        {
+            renderer.gpu.device.queue.submit([commandEncoder.finish()]);
+        }
+    }
+
+    public startRenderPass(
+        renderTarget: RenderTarget,
+        clear: CLEAR_OR_BOOL = true,
+        clearColor?: RgbaArray,
+        viewport?: Rectangle,
+        mipLevel = 0,
+        layer = 0
+    )
+    {
+        const renderTargetSystem = this._renderTargetSystem;
+
+        const gpuRenderTarget = renderTargetSystem.getGpuRenderTarget(renderTarget);
+
+        if (layer !== 0 && gpuRenderTarget.msaaTextures?.length)
+        {
+            throw new Error('[RenderTargetSystem] Rendering to array layers is not supported with MSAA render targets.');
+        }
+
+        if (mipLevel > 0 && gpuRenderTarget.msaaTextures?.length)
+        {
+            throw new Error('[RenderTargetSystem] Rendering to mip levels is not supported with MSAA render targets.');
+        }
+
+        // Idempotent ("smart") bind: if we are asked to bind the exact target/subresource the open
+        // pass is already on, and no clear is requested, reuse the live pass. We only move the
+        // viewport. This avoids a redundant pass teardown + state-cache flush (and re-binding every
+        // pipeline / bind group / vertex buffer on the next draw). A *partial* clear still forces a
+        // real begin because you cannot flip a loadOp to 'clear' mid-pass.
+        let clearBits: CLEAR_OR_BOOL = clear;
+
+        if (typeof clearBits === 'boolean')
+        {
+            clearBits = clearBits ? CLEAR.ALL : CLEAR.NONE;
+        }
+
+        // depth/stencil requested without an explicit texture — WebGPU always backs
+        // depth/stencil with a texture, so create the internal one lazily
+        if ((renderTarget.stencil || renderTarget.depth) && !renderTarget.depthStencilAttachment)
+        {
+            renderTarget.ensureDepthStencilTexture();
+        }
+
+        const hasDepthStencil = !!renderTarget.depthStencilAttachment;
+
+        const activePass = this._activePass;
+
+        const reuse = activePass !== null
+            && activePass.renderTarget === renderTarget
+            && activePass.mipLevel === mipLevel
+            && activePass.layer === layer
+            // a depth/stencil attachment added mid-pass (e.g. mask system's ensureDepthStencil)
+            // changes the attachment set, so the pass must genuinely reopen
+            && activePass.depthStencil === hasDepthStencil
+            && this._renderer.encoder.renderPassEncoder !== null
+            && clearBits === CLEAR.NONE;
+
+        // even a reused pass can change its winding: the same target rebound with the other `flipY`
+        // must key its pipelines to the new front face
+        this._renderer.pipeline.setRenderTarget(renderTarget);
+
+        if (reuse)
+        {
+            this._renderer.encoder.setViewport(viewport);
+
+            return;
+        }
+
+        const { descriptor, restore } = this._buildDescriptor(renderTarget, clear, clearColor, mipLevel, layer);
+
+        gpuRenderTarget.descriptor = descriptor;
+
+        const encoder = this._renderer.encoder;
+
+        if (restore)
+        {
+            // the copy out of the resolved texture has to be recorded between passes
+            encoder.endRenderPass();
+
+            this._beginRestoredPass(
+                renderTarget, restore, encoder.commandEncoder, () => encoder.beginRenderPass(gpuRenderTarget)
+            );
+        }
+        else
+        {
+            encoder.beginRenderPass(gpuRenderTarget);
+        }
+
+        encoder.setViewport(viewport);
+
+        this._activePass = { renderTarget, mipLevel, layer, depthStencil: hasDepthStencil };
+    }
+
+    public finishRenderPass()
+    {
+        this._renderer.encoder.endRenderPass();
+
+        // The pass is now closed; a subsequent bind to the same target must genuinely reopen it
+        // (e.g. the copyToTexture / copyColor case, which reads the resolved contents).
+        this._activePass = null;
+    }
+
+    /**
+     * Begins a pass whose MSAA colour must be restored: copies each resolved texture in `restore` into the
+     * target's back textures, begins the pass, and draws them back in before anything else (see GpuMsaaRestore).
+     * @param renderTarget - the target being reopened
+     * @param restore - the colour attachments to restore
+     * @param commandEncoder - the encoder to record the copies on, with no pass open
+     * @param beginPass - begins the pass on the same encoder
+     * @returns the begun pass
+     */
+    private _beginRestoredPass(
+        renderTarget: RenderTarget,
+        restore: number[],
+        commandEncoder: GPUCommandEncoder,
+        beginPass: () => GPURenderPassEncoder,
+    ): GPURenderPassEncoder
+    {
+        const msaaRestore = this._msaaRestore ??= new GpuMsaaRestore(this._renderer);
+
+        for (const index of restore)
+        {
+            msaaRestore.copy(commandEncoder, renderTarget, index, this._getGpuColorTexture(renderTarget, index));
+        }
+
+        const pass = beginPass();
+
+        for (const index of restore)
+        {
+            msaaRestore.draw(pass, renderTarget, index);
+        }
+
+        return pass;
+    }
+
+    /**
+     * returns the gpu texture for a color texture in the render target, the first by default
+     * mainly used by the filter manager to copy the texture for blending
+     * @param renderTarget
+     * @param index - the color attachment to get
+     * @returns a gpu texture
+     */
+    private _getGpuColorTexture(renderTarget: RenderTarget, index = 0): GPUTexture
+    {
+        if (renderTarget.colorAttachments.length === 0)
+        {
+            throw new Error('[GpuRenderTargetAdaptor] cannot get gpu color texture from a depth-only render target');
+        }
+
+        const colorTexture = renderTarget.colorAttachments[index].texture;
+
+        if (colorTexture instanceof CanvasSource && colorTexture._gpuContext)
+        {
+            return colorTexture._gpuContext.getCurrentTexture();
+        }
+
+        return this._renderer.texture.getGpuSource(colorTexture);
+    }
+
+    public getDescriptor(
+        renderTarget: RenderTarget,
+        clear: CLEAR_OR_BOOL,
+        clearValue: RgbaArray,
+        mipLevel = 0,
+        layer = 0
+    ): GPURenderPassDescriptor
+    {
+        return this._buildDescriptor(renderTarget, clear, clearValue, mipLevel, layer).descriptor;
+    }
+
+    /**
+     * Builds the pass descriptor, along with the MSAA colour attachments it opens with `clear` in place of
+     * `load`. Those buffers were discarded, so the pass must restore them before drawing.
+     * @param renderTarget - the target to render to
+     * @param clear - what to clear
+     * @param clearValue - the colour to clear to
+     * @param mipLevel - the mip level to render to
+     * @param layer - the array layer to render to
+     */
+    private _buildDescriptor(
+        renderTarget: RenderTarget,
+        clear: CLEAR_OR_BOOL,
+        clearValue: RgbaArray,
+        mipLevel = 0,
+        layer = 0
+    ): { descriptor: GPURenderPassDescriptor; restore: number[] | null }
+    {
+        let restoreList: number[] = null;
+
+        if (typeof clear === 'boolean')
+        {
+            clear = clear ? CLEAR.ALL : CLEAR.NONE;
+        }
+
+        const renderTargetSystem = this._renderTargetSystem;
+
+        const gpuRenderTarget = renderTargetSystem.getGpuRenderTarget(renderTarget);
+
+        const colorAttachments = renderTarget.colorAttachments.map(
+            (colorAttachment, i) =>
+            {
+                const colorTexture = colorAttachment.texture;
+                const context = (colorTexture instanceof CanvasSource) ? colorTexture._gpuContext : null;
+
+                let view: GPUTextureView;
+                let resolveTarget: GPUTextureView;
+                let newCanvasFrame = false;
+
+                if (context)
+                {
+                    if (layer !== 0)
+                    {
+                        // eslint-disable-next-line max-len
+                        throw new Error('[RenderTargetSystem] Rendering to array layers is not supported for canvas targets.');
+                    }
+
+                    const currentTexture = context.getCurrentTexture();
+
+                    newCanvasFrame = gpuRenderTarget.canvasTextures[i] !== currentTexture;
+                    gpuRenderTarget.canvasTextures[i] = currentTexture;
+
+                    const canvasTextureView = currentTexture.createView(colorAttachment.viewDescriptor);
+
+                    view = canvasTextureView;
+                }
+                else
+                {
+                    view = this._renderer.texture.getTextureRenderTargetView(
+                        colorAttachment.texture,
+                        mipLevel,
+                        layer,
+                        colorAttachment.viewDescriptor
+                    );
+                }
+
+                const msaaTexture = gpuRenderTarget.msaaTextures[i];
+
+                if (msaaTexture)
+                {
+                    resolveTarget = view;
+                    view = this._renderer.texture.getTextureView(msaaTexture);
+                }
+
+                let loadOp = colorAttachment.loadOp;
+
+                if (clear !== undefined)
+                {
+                    loadOp = (clear as CLEAR) & CLEAR.COLOR ? 'clear' : 'load';
+                }
+
+                clearValue ??= renderTargetSystem.defaultClearColor;
+
+                // a transient MSAA buffer is never stored, so a pass that would load it clears and restores it
+                // from the resolved texture instead (see GpuMsaaRestore). The first pass of a canvas frame has
+                // nothing to restore: its texture is new and empty, so a clear to transparent gives the same result.
+                const transient = !!msaaTexture?.transient;
+                const load = transient && loadOp !== 'clear';
+                const restore = load && !newCanvasFrame;
+
+                if (load)
+                {
+                    loadOp = 'clear';
+                    if (restore) (restoreList ??= []).push(i);
+                }
+
+                const baseAttachment: GPURenderPassColorAttachment = {
+                    view,
+                    resolveTarget,
+                    storeOp: transient ? 'discard' : (colorAttachment.storeOp ?? 'store'),
+                    loadOp,
+                };
+
+                if (colorTexture.dimension === '3d')
+                {
+                    baseAttachment.depthSlice = layer;
+                }
+
+                if (load)
+                {
+                    // restored over, or a new canvas frame, which starts transparent
+                    baseAttachment.clearValue = [0, 0, 0, 0];
+                }
+                else if (loadOp === 'clear')
+                {
+                    clearValue ??= (colorAttachment.clearValue as RgbaArray) ?? renderTargetSystem.defaultClearColor;
+                    baseAttachment.clearValue = clearValue;
+                }
+
+                for (const key in colorAttachment)
+                {
+                    if (key !== 'texture' && key !== 'viewDescriptor'
+                        && key !== 'clearValue' && key !== 'loadOp' && key !== 'storeOp')
+                    {
+                        (baseAttachment as any)[key] = (colorAttachment as any)[key];
+                    }
+                }
+
+                return baseAttachment;
+            }
+        ) as GPURenderPassColorAttachment[];
+
+        let depthStencilAttachment: GPURenderPassDepthStencilAttachment;
+
+        if (renderTarget.depthStencilAttachment)
+        {
+            // set up before the view below creates its GPU texture, which covers a depth/stencil texture added
+            // after the target was built (a mask adding stencil, RenderTarget.ensureDepthStencilTexture)
+            this._prepareDepthStencil(renderTarget, gpuRenderTarget);
+
+            const attachment = renderTarget.depthStencilAttachment;
+            const stencil = attachment.texture.format.includes('stencil');
+            const depth = attachment.texture.format.includes('depth');
+            // Depth/stencil can't be rebuilt from a resolved image, so it is only discarded when the user
+            // marked the target `transient` (single pass, never reopened). Its contents are gone after a
+            // discard, so a transient depth/stencil is never loaded either.
+            const dsStoreOp: GPUStoreOp = gpuRenderTarget.transient ? 'discard' : 'store';
+            const dsLoadOp: GPULoadOp = gpuRenderTarget.transient ? 'clear' : 'load';
+
+            depthStencilAttachment = {
+                view: this._renderer.texture.getTextureRenderTargetView(
+                    attachment.texture,
+                    mipLevel,
+                    layer,
+                    attachment.viewDescriptor
+                ),
+            };
+
+            const depthReadOnly = attachment.depthReadOnly ?? false;
+            // If depth is read-only, it's highly likely they want to sample the texture,
+            // which requires the ENTIRE texture (including stencil) to be read-only in WebGPU.
+            const stencilReadOnly = attachment.stencilReadOnly ?? depthReadOnly;
+
+            if (stencil && !stencilReadOnly)
+            {
+                depthStencilAttachment.stencilLoadOp = (clear & CLEAR.STENCIL
+                    ? 'clear' : (attachment.stencilLoadOp ?? dsLoadOp)) as GPULoadOp;
+                depthStencilAttachment.stencilStoreOp = attachment.stencilStoreOp ?? dsStoreOp;
+
+                if (depthStencilAttachment.stencilLoadOp === 'clear')
+                {
+                    depthStencilAttachment.stencilClearValue = attachment.stencilClearValue ?? 0;
+                }
+            }
+            else if (stencil && stencilReadOnly)
+            {
+                depthStencilAttachment.stencilReadOnly = true;
+            }
+
+            if (depth && !depthReadOnly)
+            {
+                depthStencilAttachment.depthLoadOp = (clear & CLEAR.DEPTH
+                    ? 'clear' : (attachment.depthLoadOp ?? dsLoadOp)) as GPULoadOp;
+                depthStencilAttachment.depthStoreOp = attachment.depthStoreOp ?? dsStoreOp;
+
+                if (depthStencilAttachment.depthLoadOp === 'clear')
+                {
+                    depthStencilAttachment.depthClearValue = attachment.depthClearValue ?? 1.0;
+                }
+            }
+            else if (depth && depthReadOnly)
+            {
+                depthStencilAttachment.depthReadOnly = true;
+            }
+
+            // Reapply any other properties from the Pixi attachment that map to WebGPU
+            // (excluding Pixi ones and ones we explicitly set above)
+            for (const key in attachment)
+            {
+                if (key !== 'texture' && key !== 'viewDescriptor'
+                    && key !== 'stencilLoadOp' && key !== 'stencilStoreOp'
+                    && key !== 'stencilClearValue' && key !== 'stencilReadOnly'
+                    && key !== 'depthLoadOp' && key !== 'depthStoreOp'
+                    && key !== 'depthClearValue' && key !== 'depthReadOnly'
+                )
+                {
+                    (depthStencilAttachment as any)[key] = (attachment as any)[key];
+                }
+            }
+        }
+
+        const descriptor: GPURenderPassDescriptor = {
+            colorAttachments,
+            depthStencilAttachment,
+            label: renderTarget.label,
+        };
+
+        return { descriptor, restore: restoreList };
+    }
+
+    public clear(
+        renderTarget: RenderTarget,
+        clear: CLEAR_OR_BOOL = true,
+        clearColor?: RgbaArray,
+        viewport?: Rectangle,
+        mipLevel = 0,
+        layer = 0
+    )
+    {
+        if (!clear) return;
+
+        const { gpu, encoder } = this._renderer;
+
+        const device = gpu.device;
+
+        const standAlone = encoder.commandEncoder === null;
+
+        if (standAlone)
+        {
+            const commandEncoder = device.createCommandEncoder();
+            const { descriptor, restore } = this._buildDescriptor(renderTarget, clear, clearColor, mipLevel, layer);
+            const beginPass = () => commandEncoder.beginRenderPass(descriptor);
+
+            // a partial clear (e.g. depth only) keeps the colour, which for MSAA means restoring it
+            const passEncoder = restore
+                ? this._beginRestoredPass(renderTarget, restore, commandEncoder, beginPass)
+                : beginPass();
+
+            passEncoder.setViewport(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
+
+            passEncoder.end();
+
+            const gpuCommands = commandEncoder.finish();
+
+            device.queue.submit([gpuCommands]);
+        }
+        else
+        {
+            this.startRenderPass(renderTarget, clear, clearColor, viewport, mipLevel, layer);
+        }
+    }
+
+    public initGpuRenderTarget(renderTarget: RenderTarget): GpuRenderTarget
+    {
+        // always true for WebGPU
+        renderTarget.isRoot = true;
+
+        const gpuRenderTarget = new GpuRenderTarget();
+
+        // the user's single-pass promise, read from the colour texture once, like `msaa`
+        gpuRenderTarget.transient = !!renderTarget.colorTexture?.antialias && !!renderTarget.colorTexture.transient;
+
+        // create a context...
+        // is a canvas...
+        renderTarget.colorAttachments.forEach((colorAttachment, i) =>
+        {
+            const colorTexture = colorAttachment.texture;
+
+            if (colorTexture instanceof CanvasSource)
+            {
+                const context = colorTexture._gpuContext ??= colorTexture.resource.getContext(
+                    'webgpu'
+                ) as unknown as GPUCanvasContext;
+
+                const alphaMode = colorTexture.transparent ? 'premultiplied' : 'opaque';
+                const canvasFormat = getCanvasContextFormat(colorTexture.format);
+
+                // configured every time, as a device replaced after a loss needs it configured again
+                try
+                {
+                    context.configure({
+                        device: this._renderer.gpu.device,
+                        usage: GPUTextureUsage.TEXTURE_BINDING
+                            | GPUTextureUsage.COPY_DST
+                            | GPUTextureUsage.RENDER_ATTACHMENT
+                            | GPUTextureUsage.COPY_SRC,
+                        format: canvasFormat,
+                        alphaMode,
+                        ...(canvasFormat === 'rgba16float'
+                            ? { toneMapping: { mode: 'extended' } }
+                            : {}),
+                    });
+                }
+                catch (e)
+                {
+                    console.error(e);
+                }
+
+                gpuRenderTarget.contexts[i] = context;
+            }
+
+            gpuRenderTarget.msaa = colorTexture.source.antialias;
+
+            if (colorTexture.antialias)
+            {
+                // On tile-based GPUs the MSAA colour buffer is always transient: never stored, and restored from
+                // the resolved texture when a pass reopens it (see GpuMsaaRestore). Elsewhere storing it is
+                // cheaper, so it is transient only when the user marks the target single-pass.
+                const msaaTexture = new TextureSource({
+                    width: 0,
+                    height: 0,
+                    sampleCount: 4,
+                    // WebGPU requires multisampled textures to have exactly 1 mip level, so this must never
+                    // inherit TextureSource.defaultOptions.autoGenerateMipmaps
+                    autoGenerateMipmaps: false,
+                    transient: this._renderer.device.extensions.tileBased || gpuRenderTarget.transient,
+                    arrayLayerCount: colorTexture.arrayLayerCount,
+                    format: colorTexture.format,
+                });
+
+                gpuRenderTarget.msaaTextures[i] = msaaTexture;
+            }
+        });
+
+        if (gpuRenderTarget.msaa)
+        {
+            gpuRenderTarget.msaaSamples = 4;
+        }
+
+        return gpuRenderTarget;
+    }
+
+    /**
+     * Sets up a depth/stencil texture for an MSAA target before its GPU texture is created: 4 samples, and
+     * the transient usage bit when the user marked the target single-pass. Both are fixed at creation, so this
+     * runs when a pass descriptor is built, just before the depth/stencil view is first made.
+     * @param renderTarget - the target whose depth/stencil texture to set up
+     * @param gpuRenderTarget - its backend target
+     */
+    private _prepareDepthStencil(renderTarget: RenderTarget, gpuRenderTarget: GpuRenderTarget): void
+    {
+        const texture = renderTarget.depthStencilAttachment?.texture;
+
+        if (!texture || !gpuRenderTarget.msaa) return;
+
+        texture.sampleCount = 4;
+        texture.transient = gpuRenderTarget.transient;
+    }
+
+    public destroyGpuRenderTarget(gpuRenderTarget: GpuRenderTarget)
+    {
+        gpuRenderTarget.contexts.forEach((context) =>
+        {
+            context.unconfigure();
+        });
+
+        gpuRenderTarget.msaaTextures.forEach((texture) =>
+        {
+            texture.destroy();
+        });
+
+        gpuRenderTarget.msaaBackTextures.forEach((texture) =>
+        {
+            texture?.destroy();
+        });
+
+        gpuRenderTarget.msaaTextures.length = 0;
+        gpuRenderTarget.msaaBackTextures.length = 0;
+        gpuRenderTarget.contexts.length = 0;
+    }
+
+    public ensureDepthStencilTexture(renderTarget: RenderTarget)
+    {
+        // TODO This function will be more useful once we cache the descriptors
+        this._prepareDepthStencil(renderTarget, this._renderTargetSystem.getGpuRenderTarget(renderTarget));
+    }
+
+    public resizeGpuRenderTarget(renderTarget: RenderTarget)
+    {
+        const gpuRenderTarget = this._renderTargetSystem.getGpuRenderTarget(renderTarget);
+
+        gpuRenderTarget.width = renderTarget.width;
+        gpuRenderTarget.height = renderTarget.height;
+
+        if (gpuRenderTarget.msaa)
+        {
+            renderTarget.colorAttachments.forEach((colorAttachment, i) =>
+            {
+                const colorTexture = colorAttachment.texture;
+
+                gpuRenderTarget.msaaTextures[i]?.resize(colorTexture.width, colorTexture.height, colorTexture._resolution);
+                gpuRenderTarget.msaaBackTextures[i]?.resize(
+                    colorTexture.width, colorTexture.height, colorTexture._resolution
+                );
+            });
+        }
+    }
+}

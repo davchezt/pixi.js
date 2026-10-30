@@ -1,0 +1,512 @@
+import { GlProgram } from '../gl/shader/GlProgram';
+import { Buffer } from '../shared/buffer/Buffer';
+import { BufferUsage } from '../shared/buffer/const';
+import { Geometry } from '../shared/geometry/Geometry';
+import { getGeometry, getGlProgram, getWebGLRenderer } from '@test-utils';
+
+import type { WebGLRenderer } from '../gl/WebGLRenderer';
+
+describe('Geometry', () =>
+{
+    it('should create correctly', () =>
+    {
+        const geometry = getGeometry();
+
+        expect(geometry).toBeInstanceOf(Geometry);
+
+        expect(geometry.buffers).toHaveLength(1);
+    });
+
+    it('should destroyed', () =>
+    {
+        const geometry = getGeometry();
+
+        geometry.destroy();
+
+        expect(geometry.buffers).toBeNull();
+    });
+
+    it('should destroyed its gpu equivalent', async () =>
+    {
+        const geometry = getGeometry();
+
+        const program = getGlProgram();
+
+        const renderer = (await getWebGLRenderer()) as WebGLRenderer;
+
+        renderer.geometry.bind(geometry, program);
+
+        const buffer = geometry.buffers[0];
+
+        geometry.destroy();
+
+        expect(geometry._gpuData).toBeEmptyObject();
+        expect(buffer.data).not.toBeNull();
+    });
+
+    it('should destroyed its gpu equivalent is destroyBuffers is true', async () =>
+    {
+        const geometry = getGeometry();
+
+        const program = getGlProgram();
+
+        const renderer = (await getWebGLRenderer()) as WebGLRenderer;
+
+        renderer.geometry.bind(geometry, program);
+
+        const buffer = geometry.buffers[0];
+
+        geometry.destroy(true);
+
+        expect(geometry._gpuData).toBeEmptyObject();
+        expect(buffer.data).toBeNull();
+    });
+
+    it('should not destroy the index buffer when destroyBuffers is false', () =>
+    {
+        const indexBuffer = new Buffer({
+            data: new Uint16Array([0, 1, 2]),
+            usage: BufferUsage.INDEX,
+        });
+        const destroySpy = jest.spyOn(indexBuffer, 'destroy');
+
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: [0, 0, 1, 0, 1, 1],
+            },
+            indexBuffer,
+        });
+
+        geometry.destroy(false);
+
+        expect(destroySpy).not.toHaveBeenCalled();
+        expect(indexBuffer.destroyed).toBe(false);
+        expect(indexBuffer.data).not.toBeNull();
+    });
+
+    it('should destroy the index buffer only once when destroyBuffers is true', () =>
+    {
+        const indexBuffer = new Buffer({
+            data: new Uint16Array([0, 1, 2]),
+            usage: BufferUsage.INDEX,
+        });
+        const destroySpy = jest.spyOn(indexBuffer, 'destroy');
+
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: [0, 0, 1, 0, 1, 1],
+            },
+            indexBuffer,
+        });
+
+        geometry.destroy(true);
+
+        expect(destroySpy).toHaveBeenCalledTimes(1);
+        expect(indexBuffer.destroyed).toBe(true);
+        expect(indexBuffer.data).toBeNull();
+    });
+
+    it('should delete its VAOs and leave the managed hash when destroyed', async () =>
+    {
+        const geometry = getGeometry();
+
+        const program = getGlProgram();
+
+        const renderer = (await getWebGLRenderer()) as WebGLRenderer;
+
+        renderer.geometry.bind(geometry, program);
+
+        const vao = geometry._gpuData[renderer.uid].vaoCache[program._key];
+        const deleteSpy = jest.spyOn(renderer.gl, 'deleteVertexArray');
+
+        expect(renderer.geometry._managedGeometries.items[geometry.uid]).toBe(geometry);
+
+        geometry.destroy();
+
+        expect(deleteSpy).toHaveBeenCalledWith(vao);
+        expect(renderer.geometry._managedGeometries.items[geometry.uid]).toBeNil();
+        expect(geometry._gpuData).toBeEmptyObject();
+    });
+
+    it('should reset the geometry system when the bound geometry is destroyed', async () =>
+    {
+        const geometry = getGeometry();
+
+        const program = getGlProgram();
+
+        const renderer = (await getWebGLRenderer()) as WebGLRenderer;
+
+        renderer.geometry.bind(geometry, program);
+
+        const bindSpy = jest.spyOn(renderer.gl, 'bindVertexArray');
+
+        geometry.destroy();
+
+        expect(bindSpy).toHaveBeenCalledWith(null);
+        expect(renderer.geometry._activeVao).toBeNull();
+        expect(renderer.geometry['_activeGeometry']).toBeNull();
+    });
+
+    it('should keep the bound geometry when another geometry is destroyed', async () =>
+    {
+        const bound = getGeometry();
+        const other = getGeometry();
+
+        const program = getGlProgram();
+
+        const renderer = (await getWebGLRenderer()) as WebGLRenderer;
+
+        renderer.geometry.bind(other, program);
+        renderer.geometry.bind(bound, program);
+
+        const vao = bound._gpuData[renderer.uid].vaoCache[program._key];
+        const bindSpy = jest.spyOn(renderer.gl, 'bindVertexArray');
+
+        other.destroy();
+
+        expect(bindSpy).not.toHaveBeenCalled();
+        expect(renderer.geometry._activeVao).toBe(vao);
+        expect(renderer.geometry['_activeGeometry']).toBe(bound);
+    });
+
+    it('should emit unload after destroy when destroyed', () =>
+    {
+        const geometry = getGeometry();
+        const events: string[] = [];
+
+        geometry.once('destroy', () => events.push('destroy'));
+        geometry.once('unload', () => events.push('unload'));
+
+        geometry.destroy();
+
+        expect(events).toEqual(['destroy', 'unload']);
+        expect(geometry.eventNames()).toEqual([]);
+    });
+
+    it('should stop listening to surviving buffers when destroyed', () =>
+    {
+        const shared = new Buffer({
+            data: new Float32Array([0, 0, 1, 0, 1, 1]),
+            usage: BufferUsage.VERTEX,
+        });
+        const survivor = new Geometry({
+            attributes: {
+                aPosition: shared,
+            },
+        });
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: shared,
+                aUv: [0, 0, 1, 0, 1, 1],
+            },
+            indexBuffer: [0, 1, 2],
+        });
+        const own = geometry.buffers[1];
+        const updateSpy = jest.fn();
+
+        survivor.on('update', updateSpy);
+
+        geometry.destroy(false);
+
+        expect(shared.listenerCount('update')).toBe(1);
+        expect(shared.listenerCount('change')).toBe(1);
+        expect(own.listenerCount('update')).toBe(0);
+        expect(own.listenerCount('change')).toBe(0);
+
+        shared.update();
+
+        expect(updateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('should set a cast data correctly', () =>
+    {
+        const buffer = new Buffer({
+            data: [1, 2, 3],
+            usage: 1,
+        });
+
+        expect(buffer.data).toBeInstanceOf(Float32Array);
+    });
+
+    it('should dispose all on the GeometrySystem', async () =>
+    {
+        const geometry = getGeometry();
+
+        const program = getGlProgram();
+
+        const renderer = (await getWebGLRenderer()) as WebGLRenderer;
+
+        renderer.geometry.bind(geometry, program);
+
+        renderer.geometry.destroyAll();
+
+        expect(geometry._gpuData[renderer.uid]).toBeNull();
+    });
+
+    it('should return bounds of a geometry correctly', () =>
+    {
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: {
+                    buffer: new Buffer({
+                        data: [-5, -5, 5, -5, 5, 5, -5, 5],
+                        usage: 1,
+                    }),
+                    format: 'float32x2',
+                    stride: 2 * 4,
+                    offset: 0,
+                }
+            }
+        });
+
+        let bounds = geometry.bounds;
+
+        expect(bounds.minX).toEqual(-5);
+        expect(bounds.minY).toEqual(-5);
+        expect(bounds.maxX).toEqual(5);
+        expect(bounds.maxY).toEqual(5);
+
+        // now update the geometry and check the bounds are updated
+
+        geometry.attributes.aPosition.buffer.data = new Float32Array([-10, -10, 10, -10, 10, 10, -10, 10]);
+
+        expect(geometry['_boundsDirty']).toEqual(true);
+
+        bounds = geometry.bounds;
+
+        expect(bounds.minX).toEqual(-10);
+        expect(bounds.minY).toEqual(-10);
+        expect(bounds.maxX).toEqual(10);
+        expect(bounds.maxY).toEqual(10);
+    });
+
+    it('should allow attribute array to be passed into constructor', () =>
+    {
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: [0, 1, 2, 3]
+            }
+        });
+
+        expect(geometry.attributes.aPosition.buffer.data).toEqual(new Float32Array([0, 1, 2, 3]));
+    });
+
+    it('should allow attribute typed array to be passed into constructor', () =>
+    {
+        const float32Array = new Float32Array([0, 1, 2, 3]);
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: float32Array
+            }
+        });
+
+        expect(geometry.attributes.aPosition.buffer.data).toBe(float32Array);
+    });
+
+    it('should allow attribute Buffer to be passed into constructor', () =>
+    {
+        const buffer = new Buffer({
+            data: new Float32Array([0, 1, 2, 3]),
+            usage: BufferUsage.VERTEX | BufferUsage.COPY_DST,
+        });
+
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: buffer
+            }
+        });
+
+        expect(geometry.attributes.aPosition.buffer).toBe(buffer);
+    });
+
+    it('should have dirty bounds if the buffer size changes', () =>
+    {
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: [0, 1, 2, 3]
+            }
+        });
+
+        expect(geometry['_boundsDirty']).toEqual(true);
+
+        geometry['_boundsDirty'] = false;
+
+        geometry.attributes.aPosition.buffer.data = new Float32Array([0, 1, 2, 3, 4, 5]);
+
+        expect(geometry['_boundsDirty']).toEqual(true);
+    });
+
+    it('should return correct vertexCount for a simple geometry', () =>
+    {
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: {
+                    buffer: new Buffer({
+                        data: new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]),
+                        usage: 1,
+                    }),
+                    format: 'float32x2',
+                    stride: 2 * 4,
+                    offset: 0,
+                }
+            }
+        });
+
+        expect(geometry.vertexCount).toEqual(4);
+    });
+
+    it('should cache vertexCount and invalidate on buffer update', () =>
+    {
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: {
+                    buffer: new Buffer({
+                        data: new Float32Array([0, 0, 1, 0, 1, 1]),
+                        usage: 1,
+                    }),
+                    format: 'float32x2',
+                    stride: 2 * 4,
+                    offset: 0,
+                }
+            }
+        });
+
+        expect(geometry.vertexCount).toEqual(3);
+        expect(geometry['_vertexCountDirty']).toEqual(false);
+
+        geometry.attributes.aPosition.buffer.data = new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]);
+
+        expect(geometry['_vertexCountDirty']).toEqual(true);
+        expect(geometry.vertexCount).toEqual(4);
+    });
+
+    it('should skip instanced attributes when calculating vertexCount', () =>
+    {
+        const geometry = new Geometry({
+            attributes: {
+                aOffset: {
+                    buffer: new Buffer({
+                        data: new Float32Array([10, 20, 30, 40, 50, 60]),
+                        usage: 1,
+                    }),
+                    format: 'float32x2',
+                    stride: 2 * 4,
+                    offset: 0,
+                    instance: true,
+                },
+                aPosition: {
+                    buffer: new Buffer({
+                        data: new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]),
+                        usage: 1,
+                    }),
+                    format: 'float32x2',
+                    stride: 2 * 4,
+                    offset: 0,
+                },
+            }
+        });
+
+        expect(geometry.vertexCount).toEqual(4);
+    });
+
+    it('should return 0 vertexCount when there are no non-instanced attributes', () =>
+    {
+        const geometry = new Geometry({
+            attributes: {
+                aOffset: {
+                    buffer: new Buffer({
+                        data: new Float32Array([10, 20]),
+                        usage: 1,
+                    }),
+                    format: 'float32x2',
+                    stride: 2 * 4,
+                    offset: 0,
+                    instance: true,
+                },
+            }
+        });
+
+        expect(geometry.vertexCount).toEqual(0);
+    });
+
+    it('should invalidate vertexCount when a new attribute is added', () =>
+    {
+        const geometry = new Geometry({
+            attributes: {
+                aPosition: {
+                    buffer: new Buffer({
+                        data: new Float32Array([0, 0, 1, 0, 1, 1]),
+                        usage: 1,
+                    }),
+                    format: 'float32x2',
+                    stride: 2 * 4,
+                    offset: 0,
+                },
+            }
+        });
+
+        expect(geometry.vertexCount).toEqual(3);
+
+        geometry.addAttribute('aUv', {
+            buffer: new Buffer({
+                data: new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]),
+                usage: 1,
+            }),
+            format: 'float32x2',
+            stride: 2 * 4,
+            offset: 0,
+        });
+
+        expect(geometry['_vertexCountDirty']).toEqual(true);
+    });
+
+    it('should preserve VAO cache when binding same geometry with multiple programs', async () =>
+    {
+        const geometry = getGeometry();
+
+        const program1 = getGlProgram();
+        const program2 = new GlProgram({
+            vertex: `
+                in vec2 aPosition;
+
+                void main(void)
+                {
+                    gl_Position = vec4(aPosition * 0.5, 0.0, 1.0);
+                }
+            `,
+            fragment: `
+                out vec4 finalColor;
+
+                void main(void)
+                {
+                    finalColor = vec4(0.0, 1.0, 0.0, 1.0);
+                }
+            `,
+        });
+
+        const renderer = (await getWebGLRenderer()) as WebGLRenderer;
+
+        // Bind geometry with first program - creates gpuData and VAO
+        renderer.geometry.bind(geometry, program1);
+
+        const gpuData = geometry._gpuData[renderer.uid];
+
+        expect(gpuData).toBeDefined();
+        expect(gpuData.vaoCache[program1._key]).toBeDefined();
+
+        const vao1 = gpuData.vaoCache[program1._key];
+
+        // Bind geometry with second program - should preserve gpuData and add second VAO entry
+        renderer.geometry.bind(geometry, program2);
+
+        // gpuData should be the same object (not replaced) - this is the key assertion
+        // that verifies the VAO cache bug fix
+        expect(geometry._gpuData[renderer.uid]).toBe(gpuData);
+
+        // First program's VAO should still be accessible
+        expect(gpuData.vaoCache[program1._key]).toBe(vao1);
+
+        // Second program should also have a VAO entry
+        expect(gpuData.vaoCache[program2._key]).toBeDefined();
+    });
+});

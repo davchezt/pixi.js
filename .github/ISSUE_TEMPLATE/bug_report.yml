@@ -1,0 +1,76 @@
+name: '🐛 Bug Report'
+description: Create a report to help us improve
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before Submitting Your Bug Report...**
+
+        This form is specifically for reporting bugs in PixiJS. If you have questions about usage
+        or aren't sure whether you've encountered a bug, please try these resources first:
+
+        - Check the [official documentation](https://pixijs.com/)
+        - Join our [Discord community](https://discord.gg/CPTjeb28nH) for help
+        - Browse [GitHub Discussions](https://github.com/pixijs/pixijs/discussions) for Q&A
+
+        Please search existing issues before submitting - your bug may have already been reported or fixed in the development branch.
+  - type: input
+    id: version
+    attributes:
+      label: PixiJS version
+    validations:
+      required: true
+  - type: input
+    id: reproduction-link
+    attributes:
+      label: Link to minimal reproduction
+      description: |
+        To help us fix your bug quickly, please provide a minimal code example that demonstrates the issue.
+
+        **Recommended platforms:**
+        - [StackBlitz](https://stackblitz.com/edit/pixijs-v8)
+        - [JSFiddle](https://jsfiddle.net/yavg3stL/)
+
+        **Keep it minimal:** Include only the essential code needed to reproduce the bug. Check our [Bug Reproduction Guidelines](https://github.com/pixijs/pixijs/tree/dev/.github/bug-repro-guidelines.md) for best practices.
+
+        ⚠️ **Important:** Issues without a valid reproduction link will be closed. Please don't submit placeholder or unrelated links.
+      placeholder: Reproduction Link
+    validations:
+      required: true
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Please provide clear, step-by-step instructions on how to trigger the bug after opening your reproduction link.
+
+        Well-written steps help us identify and fix the issue faster. You can use [Markdown](https://guides.github.com/features/mastering-markdown/) to format your instructions with lists and code blocks.
+      placeholder: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What is expected?
+    validations:
+      required: true
+  - type: textarea
+    id: actually-happening
+    attributes:
+      label: What is actually happening?
+    validations:
+      required: true
+  - type: textarea
+    id: system-info
+    attributes:
+      label: System Info
+      description: Output of `npx envinfo --system --browsers`
+      render: Shell
+      placeholder: System, Browsers
+    validations:
+      required: true
+  - type: textarea
+    id: additional-comments
+    attributes:
+      label: Any additional comments?
+      description: e.g. some background/context of how you ran into this bug or possible solutions.

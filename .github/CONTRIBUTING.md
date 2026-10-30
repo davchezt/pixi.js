@@ -31,7 +31,7 @@ the library, steps to reproduce, etc. "X isn't working!!!1!" will probably just 
 To setup for making changes you will need to take a few steps, we've outlined them below:
 
 1. Ensure you have node.js installed. You can download node.js from [nodejs.org][node]. Because
-pixi uses modern JS features, you will need a modern version of node. v4+ is recommended.
+pixi uses modern JS features, you will need a modern version of node. v24+ is recommended.
 
 2. Fork the **[pixi.js][pixi]** repository, if you are unsure how to do this GitHub has a guides
 for the [command line][fork-cli] and for the [GitHub Client][fork-gui].
@@ -64,11 +64,48 @@ bug if it ever happens again. This prevents regressions from sneaking in.
 Tips for a faster workflow:
 
 - Run `npm start` in one terminal. This watches the source tree and compiles it incrementally.
-- When desired, run `npm run unit-test` in another terminal. This runs tests using the compilation output from `npm start`.
-- Run `npm run unit-test:debug` to use headful DevTools to debug or develop tests
-- For testing specific a package, use `--package` flag, e.g., `npm run unit-test -- --package=@pixi/math`
-- The `--package` flag supports multiple packages, e.g., `npm run unit-test -- --package=@pixi/math --package=@pixi/core`
-- The `--package` flag supports debug testing as well, e.g., `npm run unit-test:debug -- --package=@pixi/math`
+- Run `npm run test unit` to run unit tests, or `npm run test visual` to run visual regression tests.
+- Run `npm run test unit debug` to use headful DevTools to debug or develop tests.
+
+You can also run individual check categories:
+
+- `npm run test lint` — ESLint only
+- `npm run test types` — Type checking only
+- `npm run test unit` — Unit tests only
+- `npm run test visual` — Visual regression tests only
+
+For more details on the build and test pipeline, see [scripts/README.md](../scripts/README.md).
+
+#### Visual Regression Testing
+
+PixiJS uses a custom visual tester that allows you to create pixi scenes and compare them to a reference image.
+These tests can be found in the [visual scenes directory](../tests/visual/scenes/). To run these tests, run `npm run test visual` from the command line, or run `npm run test visual debug` to use headful DevTools to debug or develop tests.
+
+All visual tests must end with `.scene.ts` and follows this format:
+
+```ts
+import { Graphics } from '~/scene';
+
+import type { Container } from '~/scene';
+import type { Renderer } from '~/rendering';
+import type { TestScene } from '../../types';
+
+export const scene: TestScene = {
+    it: 'should render a red rectangle',
+    pixelMatch: 40,                          // optional: pixel tolerance for comparison
+    options: { backgroundColor: 'white' },    // optional: renderer options passed to PixiJS
+    renderers: ['webgl2', 'webgpu'],          // optional: only run on specific renderers
+    excludeRenderers: ['canvas'],             // optional: exclude specific renderers
+    only: false,                              // optional: isolate this test
+    skip: false,                              // optional: skip this test
+    create: async (scene: Container, renderer: Renderer) =>
+    {
+        const rect = new Graphics().rect(0, 0, 100, 100).fill('red');
+
+        scene.addChild(rect);
+    },
+};
+```
 
 ### Submitting Your Change
 
@@ -81,21 +118,20 @@ from your fork to the main **pixi.js** repository on the branch you used in the 
 - No trailing whitespace, blank lines should have no whitespace.
 - Always favor strict equals `===` unless you *need* to use type coercion.
 - Follow conventions already in the code, and listen to eslint.
-- **Ensure changes are eslint validated.** After making a change be sure to run the build process
-to ensure that you didn't break anything. You can do this with `npm test` which will run
-eslint, rebuild, then run the test suite.
+- **Ensure changes are eslint validated.** After making a change be sure to run `npm test` to
+ensure that you didn't break anything. This will run eslint, type checking, and the test suite.
 
 [faq]: http://www.pixijs.com/faq
 [fiddle]: http://jsfiddle.net
 [fork-cli]: https://help.github.com/articles/fork-a-repo/
 [fork-gui]: https://guides.github.com/activities/forking/
 [forums]: http://www.html5gamedevs.com/forum/15-pixijs/
-[issues]: https://github.com/pixijs/pixi.js/issues
+[issues]: https://github.com/pixijs/pixijs/issues
 [jsbin]: http://jsbin.com/
 [node]: http://nodejs.org
-[pixi]: https://github.com/pixijs/pixi.js
+[pixi]: https://github.com/pixijs/pixijs
 [tutorials]: http://www.pixijs.com/tutorials
-[wiki]: https://github.com/pixijs/pixi.js/wiki
+[wiki]: https://github.com/pixijs/pixijs/wiki
 
 ## Contributor Code of Conduct
 

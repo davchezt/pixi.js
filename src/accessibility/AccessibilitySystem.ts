@@ -1,0 +1,915 @@
+/* eslint-disable no-restricted-globals */
+import { CanvasObserver } from '../dom/CanvasObserver';
+import { FederatedEvent } from '../events/FederatedEvent';
+import { ExtensionType } from '../extensions/Extensions';
+import { isMobile } from '../utils/browser/isMobile';
+import { removeItems } from '../utils/data/removeItems';
+import { type AccessibleHTMLElement } from './accessibilityTarget';
+
+import type { Rectangle } from '../maths/shapes/Rectangle';
+import type { System } from '../rendering/renderers/shared/system/System';
+import type { Renderer } from '../rendering/renderers/types';
+import type { Container } from '../scene/container/Container';
+import type { isMobileResult } from '../utils/browser/isMobile';
+
+/** @ignore */
+const KEY_CODE_TAB = 9;
+
+const DIV_TOUCH_SIZE = 100;
+const DIV_TOUCH_POS_X = 0;
+const DIV_TOUCH_POS_Y = 0;
+const DIV_TOUCH_ZINDEX = 2;
+
+const DIV_HOOK_SIZE = 1;
+const DIV_HOOK_POS_X = -1000;
+const DIV_HOOK_POS_Y = -1000;
+const DIV_HOOK_ZINDEX = 2;
+
+/**
+ * Initialisation options for the accessibility system when used with an Application.
+ * @category accessibility
+ * @advanced
+ */
+export interface AccessibilitySystemOptions
+{
+    /** Options for the accessibility system */
+    accessibilityOptions?: AccessibilityOptions;
+}
+
+/**
+ * The options for the accessibility system.
+ * @category accessibility
+ * @advanced
+ */
+export interface AccessibilityOptions
+{
+    /** Whether to enable accessibility features on initialization instead of waiting for tab key */
+    enabledByDefault?: boolean;
+    /** Whether to visually show the accessibility divs for debugging */
+    debug?: boolean;
+    /** Whether to allow tab key press to activate accessibility features */
+    activateOnTab?: boolean;
+    /** Whether to deactivate accessibility when mouse moves */
+    deactivateOnMouseMove?: boolean;
+}
+
+/**
+ * The Accessibility system provides screen reader and keyboard navigation support for PixiJS content.
+ * It creates an accessible DOM layer over the canvas that can be controlled programmatically or through user interaction.
+ *
+ * By default, the system activates when users press the tab key. This behavior can be customized through options:
+ * ```js
+ * const app = new Application({
+ *     accessibilityOptions: {
+ *     // Enable immediately instead of waiting for tab
+ *     enabledByDefault: true,
+ *     // Disable tab key activation
+ *     activateOnTab: false,
+ *     // Show/hide accessibility divs
+ *     debug: false,
+ *     // Prevent accessibility from being deactivated when mouse moves
+ *     deactivateOnMouseMove: false,
+ * }
+ * });
+ * ```
+ *
+ * The system can also be controlled programmatically by accessing the `renderer.accessibility` property:
+ * ```js
+ * app.renderer.accessibility.setAccessibilityEnabled(true);
+ * ```
+ *
+ * To make individual containers accessible:
+ * ```js
+ * container.accessible = true;
+ * ```
+ * There are several properties that can be set on a Container to control its accessibility which can
+ * be found here: {@link AccessibleOptions}.
+ * @category accessibility
+ * @standard
+ */
+export class AccessibilitySystem implements System<AccessibilitySystemOptions>
+{
+    /** @ignore */
+    public static extension = {
+        type: [
+            ExtensionType.WebGLSystem,
+            ExtensionType.WebGPUSystem,
+        ],
+        name: 'accessibility',
+    } as const;
+
+    /**
+     * The default options used by the system.
+     * You can set these before initializing the {@link Application} to change the default behavior.
+     * @example
+     * ```js
+     * import { AccessibilitySystem } from 'pixi.js';
+     *
+     * AccessibilitySystem.defaultOptions.enabledByDefault = true;
+     *
+     * const app = new Application()
+     * app.init()
+     * ```
+     */
+    public static defaultOptions: AccessibilityOptions = {
+        /**
+         * Whether to enable accessibility features on initialization
+         * @default false
+         */
+        enabledByDefault: false,
+        /**
+         * Whether to visually show the accessibility divs for debugging
+         * @default false
+         */
+        debug: false,
+        /**
+         * Whether to activate accessibility when tab key is pressed
+         * @default true
+         */
+        activateOnTab: true,
+        /**
+         * Whether to deactivate accessibility when mouse moves
+         * @default true
+         */
+        deactivateOnMouseMove: true,
+    };
+
+    /** Whether accessibility divs are visible for debugging */
+    public debug = false;
+
+    /** Whether to activate on tab key press */
+    private _activateOnTab = true;
+
+    /** Whether to deactivate accessibility when mouse moves */
+    private _deactivateOnMouseMove = true;
+
+    /**
+     * The renderer this accessibility manager works for.
+     * @type {WebGLRenderer|WebGPURenderer}
+     */
+    private _renderer: Renderer;
+
+    /** Internal variable, see isActive getter. */
+    private _isActive = false;
+
+    /** Internal variable, see isMobileAccessibility getter. */
+    private _isMobileAccessibility = false;
+
+    /** Button element for handling touch hooks. */
+    private _hookDiv: HTMLElement | null;
+
+    /** This is the dom element that will sit over the PixiJS element. This is where the div overlays will go. */
+    private _div: HTMLElement | null = null;
+
+    /** A simple pool for storing divs. */
+    private _pools: Record<string, AccessibleHTMLElement[]> = {};
+
+    /** This is a tick used to check if an object is no longer being rendered. */
+    private _renderId = 0;
+
+    /** The array of currently active accessible items. */
+    private _children: Container[] = [];
+
+    /** Count to throttle div updates on android devices. */
+    private _androidUpdateCount = 0;
+
+    /**  The frequency to update the div elements. */
+    private readonly _androidUpdateFrequency = 500; // 2fps
+    private _canvasObserver: CanvasObserver;
+
+    // eslint-disable-next-line @typescript-eslint/prefer-readonly
+    private _isRunningTests: boolean = false;
+
+    /** Bound function references for proper event listener removal */
+    private _boundOnKeyDown: (e: KeyboardEvent) => void = this._onKeyDown.bind(this);
+    private _boundOnMouseMove: (e: MouseEvent) => void = this._onMouseMove.bind(this);
+
+    // eslint-disable-next-line jsdoc/require-param
+    /**
+     * @param {WebGLRenderer|WebGPURenderer} renderer - A reference to the current renderer
+     */
+    constructor(renderer: Renderer, private readonly _mobileInfo: isMobileResult = isMobile)
+    {
+        this._hookDiv = null;
+
+        if (_mobileInfo.tablet || _mobileInfo.phone)
+        {
+            this._createTouchHook();
+        }
+
+        this._renderer = renderer;
+    }
+
+    /**
+     * Value of `true` if accessibility is currently active and accessibility layers are showing.
+     * @type {boolean}
+     * @readonly
+     */
+    get isActive(): boolean
+    {
+        return this._isActive;
+    }
+
+    /**
+     * Value of `true` if accessibility is enabled for touch devices.
+     * @type {boolean}
+     * @readonly
+     */
+    get isMobileAccessibility(): boolean
+    {
+        return this._isMobileAccessibility;
+    }
+
+    /**
+     * Button element for handling touch hooks.
+     * @readonly
+     */
+    get hookDiv()
+    {
+        return this._hookDiv;
+    }
+
+    /**
+     * The DOM element that will sit over the PixiJS element. This is where the div overlays will go.
+     * @readonly
+     */
+    get div()
+    {
+        return this._div;
+    }
+
+    /**
+     * Creates the touch hooks.
+     * @private
+     */
+    private _createTouchHook(): void
+    {
+        const hookDiv = document.createElement('button');
+
+        hookDiv.style.width = `${DIV_HOOK_SIZE}px`;
+        hookDiv.style.height = `${DIV_HOOK_SIZE}px`;
+        hookDiv.style.position = 'absolute';
+        hookDiv.style.top = `${DIV_HOOK_POS_X}px`;
+        hookDiv.style.left = `${DIV_HOOK_POS_Y}px`;
+        hookDiv.style.zIndex = DIV_HOOK_ZINDEX.toString();
+        hookDiv.style.backgroundColor = '#FF0000';
+        hookDiv.title = 'select to enable accessibility for this content';
+
+        hookDiv.addEventListener('focus', () =>
+        {
+            this._isMobileAccessibility = true;
+            this._activate();
+            this._destroyTouchHook();
+        });
+
+        document.body.appendChild(hookDiv);
+        this._hookDiv = hookDiv;
+    }
+
+    /**
+     * Destroys the touch hooks.
+     * @private
+     */
+    private _destroyTouchHook(): void
+    {
+        if (!this._hookDiv)
+        {
+            return;
+        }
+        document.body.removeChild(this._hookDiv);
+        this._hookDiv = null;
+    }
+
+    /**
+     * Activating will cause the Accessibility layer to be shown.
+     * This is called when a user presses the tab key.
+     * @private
+     */
+    private _activate(): void
+    {
+        if (this._isActive)
+        {
+            return;
+        }
+
+        this._isActive = true;
+
+        // Create and add div if needed
+        if (!this._div)
+        {
+            this._div = document.createElement('div');
+            this._div.style.position = 'absolute';
+            this._div.style.top = `${DIV_TOUCH_POS_X}px`;
+            this._div.style.left = `${DIV_TOUCH_POS_Y}px`;
+            this._div.style.pointerEvents = 'none';
+            this._div.style.zIndex = DIV_TOUCH_ZINDEX.toString();
+
+            // Initialize the CanvasTransformSync to keep the DOM element in sync with the canvas
+            this._canvasObserver = new CanvasObserver({
+                domElement: this._div,
+                renderer: this._renderer,
+            });
+        }
+
+        // The keydown listener is registered in init because it has to fire while the layer is inactive.
+        if (this._deactivateOnMouseMove)
+        {
+            globalThis.document.addEventListener('mousemove', this._boundOnMouseMove, true);
+        }
+
+        // Check if canvas is in DOM
+        const canvas = this._renderer.view.canvas;
+
+        if (!canvas.parentNode)
+        {
+            const observer = new MutationObserver(() =>
+            {
+                if (canvas.parentNode)
+                {
+                    observer.disconnect();
+
+                    // Add to DOM
+                    this._canvasObserver.ensureAttached();
+                    // Only start the postrender runner after div is ready
+                    this._initAccessibilitySetup();
+                }
+            });
+
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+        else
+        {
+            // Add to DOM
+            this._canvasObserver.ensureAttached();
+            // Div is ready, initialize accessibility
+            this._initAccessibilitySetup();
+        }
+    }
+
+    // New method to handle initialization after div is ready
+    private _initAccessibilitySetup(): void
+    {
+        // Add the postrender runner to start processing accessible objects
+        this._renderer.runners.postrender.add(this);
+
+        // Force an initial update of accessible objects
+        if (this._renderer.lastObjectRendered)
+        {
+            this._updateAccessibleObjects(this._renderer.lastObjectRendered as Container);
+        }
+    }
+
+    /**
+     * Deactivates the accessibility system. Removes listeners and accessibility elements.
+     * @private
+     */
+    private _deactivate(): void
+    {
+        if (!this._isActive || this._isMobileAccessibility)
+        {
+            return;
+        }
+
+        this._isActive = false;
+
+        // The keydown listener stays registered so that tab can reactivate the layer.
+        globalThis.document.removeEventListener('mousemove', this._boundOnMouseMove, true);
+
+        this._renderer.runners.postrender.remove(this);
+
+        // Remove all active accessibility elements
+        for (const child of this._children)
+        {
+            if (child._accessibleDiv?.parentNode)
+            {
+                child._accessibleDiv.parentNode.removeChild(child._accessibleDiv);
+                child._accessibleDiv = null;
+            }
+            child._accessibleActive = false;
+        }
+
+        // Clear the pool of divs
+        for (const accessibleType in this._pools)
+        {
+            const pool = this._pools[accessibleType];
+
+            pool.forEach((div) =>
+            {
+                if (div.parentNode)
+                {
+                    div.parentNode.removeChild(div);
+                }
+            });
+            delete this._pools[accessibleType];
+        }
+
+        // Remove parent div from DOM
+        if (this._div?.parentNode)
+        {
+            this._div.parentNode.removeChild(this._div);
+        }
+
+        this._pools = {};
+        this._children = [];
+    }
+
+    /**
+     * This recursive function will run through the scene graph and add any new accessible objects to the DOM layer.
+     * @private
+     * @param {Container} container - The Container to check.
+     */
+    private _updateAccessibleObjects(container: Container): void
+    {
+        if (!container.visible || !container.accessibleChildren)
+        {
+            return;
+        }
+
+        // Separate check for accessibility without requiring interactivity
+        if (container.accessible)
+        {
+            if (!container._accessibleActive)
+            {
+                this._addChild(container);
+            }
+
+            container._renderId = this._renderId;
+        }
+
+        const children = container.children;
+
+        if (children)
+        {
+            for (let i = 0; i < children.length; i++)
+            {
+                this._updateAccessibleObjects(children[i] as Container);
+            }
+        }
+    }
+
+    /**
+     * Runner init called, view is available at this point.
+     * @ignore
+     */
+    public init(options?: AccessibilitySystemOptions): void
+    {
+        // Ensure we have the accessibilityOptions object
+        const defaultOpts = AccessibilitySystem.defaultOptions;
+        const mergedOptions = {
+            accessibilityOptions: {
+                ...defaultOpts,
+                ...(options?.accessibilityOptions || {})
+            }
+        };
+
+        this.debug = mergedOptions.accessibilityOptions.debug;
+        this._activateOnTab = mergedOptions.accessibilityOptions.activateOnTab;
+        this._deactivateOnMouseMove = mergedOptions.accessibilityOptions.deactivateOnMouseMove;
+
+        if (this._activateOnTab)
+        {
+            globalThis.addEventListener('keydown', this._boundOnKeyDown, false);
+        }
+
+        if (mergedOptions.accessibilityOptions.enabledByDefault)
+        {
+            this._activate();
+        }
+
+        this._renderer.runners.postrender.remove(this);
+    }
+
+    /**
+     * Updates the accessibility layer during rendering.
+     * - Removes divs for containers no longer in the scene
+     * - Updates the position and dimensions of the root div
+     * - Updates positions of active accessibility divs
+     * Only fires while the accessibility system is active.
+     * @ignore
+     */
+    public postrender(): void
+    {
+        /* On Android default web browser, tab order seems to be calculated by position rather than tabIndex,
+        *  moving buttons can cause focus to flicker between two buttons making it hard/impossible to navigate,
+        *  so I am just running update every half a second, seems to fix it.
+        */
+        const now = performance.now();
+
+        if (this._mobileInfo.android.device && now < this._androidUpdateCount)
+        {
+            return;
+        }
+
+        this._androidUpdateCount = now + this._androidUpdateFrequency;
+
+        if ((!this._renderer.renderingToScreen || !this._renderer.view.canvas)
+            && !this._isRunningTests)
+        {
+            return;
+        }
+
+        // Track which containers are still active this frame
+        const activeIds = new Set<number>();
+
+        if (this._renderer.lastObjectRendered)
+        {
+            this._updateAccessibleObjects(this._renderer.lastObjectRendered as Container);
+
+            // Mark all updated containers as active
+            for (const child of this._children)
+            {
+                if (child._renderId === this._renderId)
+                {
+                    activeIds.add(this._children.indexOf(child));
+                }
+            }
+        }
+
+        // Remove any containers that weren't updated this frame
+        for (let i = this._children.length - 1; i >= 0; i--)
+        {
+            const child = this._children[i];
+
+            if (!activeIds.has(i))
+            {
+                // Container was removed, clean up its accessibility div
+                if (child._accessibleDiv && child._accessibleDiv.parentNode)
+                {
+                    child._accessibleDiv.parentNode.removeChild(child._accessibleDiv);
+
+                    const pool = this._getPool(child.accessibleType);
+
+                    pool.push(child._accessibleDiv);
+                    child._accessibleDiv = null;
+                }
+                child._accessibleActive = false;
+                removeItems(this._children, i, 1);
+            }
+        }
+
+        // Update root div dimensions if needed
+        if (this._renderer.renderingToScreen)
+        {
+            // Ensure the main DOM element is attached to the same parent as the canvas
+            this._canvasObserver.ensureAttached();
+        }
+
+        // Update positions of existing divs
+        for (let i = 0; i < this._children.length; i++)
+        {
+            const child = this._children[i];
+
+            if (!child._accessibleActive || !child._accessibleDiv)
+            {
+                continue;
+            }
+
+            // Only update position-related properties
+            const div = child._accessibleDiv;
+            const hitArea = (child.hitArea || child.getBounds().rectangle) as Rectangle;
+
+            if (child.hitArea)
+            {
+                const wt = child.worldTransform;
+
+                div.style.left = `${(wt.tx + (hitArea.x * wt.a))}px`;
+                div.style.top = `${(wt.ty + (hitArea.y * wt.d))}px`;
+                div.style.width = `${hitArea.width * wt.a}px`;
+                div.style.height = `${hitArea.height * wt.d}px`;
+            }
+            else
+            {
+                this._capHitArea(hitArea);
+                div.style.left = `${hitArea.x}px`;
+                div.style.top = `${hitArea.y}px`;
+                div.style.width = `${hitArea.width}px`;
+                div.style.height = `${hitArea.height}px`;
+            }
+        }
+
+        // increment the render id..
+        this._renderId++;
+    }
+
+    /**
+     * private function that will visually add the information to the
+     * accessibility div
+     * @param {HTMLElement} div -
+     */
+    private _updateDebugHTML(div: AccessibleHTMLElement): void
+    {
+        div.innerHTML = `type: ${div.type}</br> title : ${div.title}</br> tabIndex: ${div.tabIndex}`;
+    }
+
+    /**
+     * Adjust the hit area based on the bounds of a display object
+     * @param {Rectangle} hitArea - Bounds of the child
+     */
+    private _capHitArea(hitArea: Rectangle): void
+    {
+        if (hitArea.x < 0)
+        {
+            hitArea.width += hitArea.x;
+            hitArea.x = 0;
+        }
+
+        if (hitArea.y < 0)
+        {
+            hitArea.height += hitArea.y;
+            hitArea.y = 0;
+        }
+
+        const { width: viewWidth, height: viewHeight } = this._renderer;
+
+        if (hitArea.x + hitArea.width > viewWidth)
+        {
+            hitArea.width = viewWidth - hitArea.x;
+        }
+
+        if (hitArea.y + hitArea.height > viewHeight)
+        {
+            hitArea.height = viewHeight - hitArea.y;
+        }
+    }
+
+    /**
+     * Creates or reuses a div element for a Container and adds it to the accessibility layer.
+     * Sets up ARIA attributes, event listeners, and positioning based on the container's properties.
+     * @private
+     * @param {Container} container - The child to make accessible.
+     */
+    private _addChild<T extends Container>(container: T): void
+    {
+        const pool = this._getPool(container.accessibleType);
+
+        let div = pool.pop();
+
+        if (div)
+        {
+            /*
+             * Reset these properties so we don't have outdated metadata.
+             * It was possible to end up with:
+             * - the old tabIndex if container.interactive is false
+             * - the old aria-label if container.accessibleHint is not set
+             */
+            div.innerHTML = '';
+            div.removeAttribute('title');
+            div.removeAttribute('aria-label');
+            div.tabIndex = 0;
+        }
+        else
+        {
+            if (container.accessibleType === 'button')
+            {
+                div = document.createElement('button');
+                // hide the text like the non-button cssText does; debug mode keeps it visible
+                if (!this.debug)
+                {
+                    div.style.color = 'transparent';
+                }
+            }
+            else
+            {
+                div = document.createElement(container.accessibleType);
+                div.style.cssText = `
+                        color: transparent;
+                        pointer-events: none;
+                        padding: 0;
+                        margin: 0;
+                        border: 0;
+                        outline: 0;
+                        background: transparent;
+                        box-sizing: border-box;
+                        user-select: none;
+                        -webkit-user-select: none;
+                        -moz-user-select: none;
+                        -ms-user-select: none;
+                    `;
+            }
+            div.style.width = `${DIV_TOUCH_SIZE}px`;
+            div.style.height = `${DIV_TOUCH_SIZE}px`;
+            div.style.backgroundColor = this.debug ? 'rgba(255,255,255,0.5)' : 'transparent';
+            div.style.position = 'absolute';
+            div.style.zIndex = DIV_TOUCH_ZINDEX.toString();
+            div.style.borderStyle = 'none';
+
+            // ARIA attributes ensure that button title and hint updates are announced properly
+            if (navigator.userAgent.toLowerCase().includes('chrome'))
+            {
+                // Chrome doesn't need aria-live to work as intended; in fact it just gets more confused.
+                div.setAttribute('aria-live', 'off');
+            }
+            else
+            {
+                div.setAttribute('aria-live', 'polite');
+            }
+
+            if (navigator.userAgent.match(/rv:.*Gecko\//))
+            {
+                // FireFox needs this to announce only the new button name
+                div.setAttribute('aria-relevant', 'additions');
+            }
+            else
+            {
+                // required by IE, other browsers don't much care
+                div.setAttribute('aria-relevant', 'text');
+            }
+
+            div.addEventListener('click', this._onClick.bind(this));
+            div.addEventListener('focus', this._onFocus.bind(this));
+            div.addEventListener('focusout', this._onFocusOut.bind(this));
+        }
+
+        // set pointer events
+        div.style.pointerEvents = container.accessiblePointerEvents;
+        // set the type, this defaults to button!
+        div.type = container.accessibleType;
+
+        // must run after the pool reset above, which clears innerHTML
+        if (container.accessibleText)
+        {
+            div.innerText = container.accessibleText;
+        }
+
+        if (container.accessibleTitle && container.accessibleTitle !== null)
+        {
+            div.title = container.accessibleTitle;
+        }
+        else if (!container.accessibleHint
+            || container.accessibleHint === null)
+        {
+            div.title = `container ${container.tabIndex}`;
+        }
+
+        if (container.accessibleHint
+            && container.accessibleHint !== null)
+        {
+            div.setAttribute('aria-label', container.accessibleHint);
+        }
+
+        if (container.interactive)
+        {
+            div.tabIndex = container.tabIndex;
+        }
+        else
+        {
+            // reset tabIndex back to 0 in case this div instance was pulled from the pool and already had a value
+            div.tabIndex = 0;
+        }
+
+        if (this.debug)
+        {
+            this._updateDebugHTML(div);
+        }
+
+        container._accessibleActive = true;
+        container._accessibleDiv = div;
+        div.container = container;
+
+        this._children.push(container);
+        this._div.appendChild(container._accessibleDiv);
+    }
+
+    /**
+     * Dispatch events with the EventSystem.
+     * @param e
+     * @param type
+     * @private
+     */
+    private _dispatchEvent(e: UIEvent, type: string[]): void
+    {
+        const { container: target } = e.target as AccessibleHTMLElement;
+        const boundary = this._renderer.events.rootBoundary;
+        const event: FederatedEvent = Object.assign(new FederatedEvent(boundary), { target });
+
+        boundary.rootTarget = this._renderer.lastObjectRendered as Container;
+        type.forEach((type) => boundary.dispatchEvent(event, type));
+    }
+
+    /**
+     * Maps the div button press to pixi's EventSystem (click)
+     * @private
+     * @param {MouseEvent} e - The click event.
+     */
+    private _onClick(e: MouseEvent): void
+    {
+        this._dispatchEvent(e, ['click', 'pointertap', 'tap']);
+    }
+
+    /**
+     * Maps the div focus events to pixi's EventSystem (mouseover)
+     * @private
+     * @param {FocusEvent} e - The focus event.
+     */
+    private _onFocus(e: FocusEvent): void
+    {
+        if (!(e.target as Element).getAttribute('aria-live'))
+        {
+            (e.target as Element).setAttribute('aria-live', 'assertive');
+        }
+
+        this._dispatchEvent(e, ['mouseover']);
+    }
+
+    /**
+     * Maps the div focus events to pixi's EventSystem (mouseout)
+     * @private
+     * @param {FocusEvent} e - The focusout event.
+     */
+    private _onFocusOut(e: FocusEvent): void
+    {
+        if (!(e.target as Element).getAttribute('aria-live'))
+        {
+            (e.target as Element).setAttribute('aria-live', 'polite');
+        }
+
+        this._dispatchEvent(e, ['mouseout']);
+    }
+
+    /**
+     * Is called when a key is pressed
+     * @private
+     * @param {KeyboardEvent} e - The keydown event.
+     */
+    private _onKeyDown(e: KeyboardEvent): void
+    {
+        if (e.keyCode !== KEY_CODE_TAB || !this._activateOnTab)
+        {
+            return;
+        }
+
+        this._activate();
+    }
+
+    /**
+     * Is called when the mouse moves across the renderer element
+     * @private
+     * @param {MouseEvent} e - The mouse event.
+     */
+    private _onMouseMove(e: MouseEvent): void
+    {
+        if (e.movementX === 0 && e.movementY === 0)
+        {
+            return;
+        }
+
+        this._deactivate();
+    }
+
+    /**
+     * Destroys the accessibility system. Removes all elements and listeners.
+     * > [!IMPORTANT] This is typically called automatically when the {@link Application} is destroyed.
+     * > A typically user should not need to call this method directly.
+     */
+    public destroy(): void
+    {
+        this._deactivate();
+        this._destroyTouchHook();
+
+        this._canvasObserver?.destroy();
+        this._canvasObserver = null;
+
+        this._div = null;
+        this._pools = null;
+        this._children = null;
+        this._renderer = null;
+        this._hookDiv = null;
+
+        // Remove listeners using the stored bound references
+        globalThis.removeEventListener('keydown', this._boundOnKeyDown);
+        this._boundOnKeyDown = null;
+        globalThis.document.removeEventListener('mousemove', this._boundOnMouseMove, true);
+        this._boundOnMouseMove = null;
+    }
+
+    /**
+     * Enables or disables the accessibility system.
+     * @param enabled - Whether to enable or disable accessibility.
+     * @example
+     * ```js
+     * app.renderer.accessibility.setAccessibilityEnabled(true); // Enable accessibility
+     * app.renderer.accessibility.setAccessibilityEnabled(false); // Disable accessibility
+     * ```
+     */
+    public setAccessibilityEnabled(enabled: boolean): void
+    {
+        if (enabled)
+        {
+            this._activate();
+        }
+        else
+        {
+            this._deactivate();
+        }
+    }
+
+    private _getPool(accessibleType: string): AccessibleHTMLElement[]
+    {
+        if (!this._pools[accessibleType])
+        {
+            this._pools[accessibleType] = [];
+        }
+
+        return this._pools[accessibleType];
+    }
+}

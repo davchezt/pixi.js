@@ -1,103 +1,446 @@
 {
-  "name": "pixi.js-monorepo",
-  "private": true,
+  "name": "pixi.js",
+  "version": "8.22.0",
+  "author": "PixiJS Team",
+  "homepage": "http://pixijs.com/",
+  "bugs": "https://github.com/pixijs/pixijs/issues",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pixijs/pixijs.git"
+  },
+  "funding": {
+    "type": "opencollective",
+    "url": "https://opencollective.com/pixijs"
+  },
   "workspaces": [
-    "bundles/*",
-    "packages/*",
-    "packages/canvas/*",
-    "packages/filters/*",
-    "tools/*"
+    "examples",
+    "playground"
+  ],
+  "main": "lib/index.js",
+  "module": "lib/index.mjs",
+  "types": "lib/index.d.ts",
+  "typesVersions": {
+    "<6.0": {
+      "lib/index.d.ts": [
+        "lib/index.legacy.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "lib",
+    "dist",
+    "transcoders",
+    "skills"
   ],
   "scripts": {
-    "start": "run-s watch",
-    "clean:build": "rimraf \"{bundles,packages,packages/canvas,packages/filters,out}/*/dist\"",
-    "clean:dist": "rimraf dist/*",
-    "clean:modules": "lerna clean --yes",
-    "clean": "run-s clean:*",
-    "floss": "cross-env TS_NODE_PROJECT=tsconfig.tests.json floss -r ts-node/register/transpile-only -p test",
-    "test": "run-s lint:tests floss",
-    "unit-test": "npm run floss -- --",
-    "unit-test:debug": "npm run floss -- --debug --",
-    "precoverage": "run-s lint:tests",
-    "coverage": "nyc run-s floss && nyc report --reporter=html",
-    "coverage:ci": "run-s coverage && nyc report --reporter=text-lcov > coverage.lcov",
-    "docs": "mkdirp dist && webdoc -R README.md",
-    "lint:src": "eslint --ext .js --ext .ts test bundles packages scripts --ignore-path .gitignore --ignore-pattern \"**/*.tests.ts\" --max-warnings 0",
-    "lint:tests": "eslint -c .eslintrc.tests.json --ext .ts \"**/*.tests.ts\" --max-warnings 0",
-    "lint": "run-s lint:*",
-    "lintfix": "run-s \"lint:* -- --fix\"",
-    "types": "tsc -noEmit",
-    "build": "run-s clean:build build:dev",
-    "build:prod": "cross-env NODE_ENV=production rollup -c",
-    "build:dev": "rollup -c",
-    "build:types": "rimraf out && tsc && api-extractor-lerna-monorepo && rimraf out && ts-node-script ./scripts/injectGlobalMixins.ts",
-    "watch": "rollup -cw",
-    "dist": "run-s lint:src types build:prod build:types docs",
-    "postdist": "copyfiles -f bundles/*/dist/browser/* dist && copyfiles -f \"packages/**/dist/browser/*\" dist/packages",
-    "prerelease": "run-s clean:build test",
-    "postversion": "run-s lint:src types build:prod build:types",
-    "release": "lerna version --exact --force-publish",
-    "version": "ts-node scripts/fixPeerVersions.ts && npx --yes npm@7.20.2 i --package-lock-only && git add package-lock.json",
-    "prepublish-ci": "run-s build:types",
-    "publish-ci": "lerna publish from-package --yes --no-verify-access",
-    "webdoc": "webdoc"
+    "prepare": "husky install",
+    "start": "npm run dev --prefix playground & npm run watch:lib",
+    "clean": "rimraf \"{lib,dist}\" .pr_uploads .s3_uploads --glob",
+    "build": "node ./scripts/build.mts",
+    "build:lib": "node ./scripts/build.mts --lib --dev",
+    "build:docs": "npx typedoc --options .configs/typedoc.json && node ./scripts/typedoc/html-to-md.mts && copyfiles -f dist/pixi.min.mjs dist/pixi.min.mjs.map .s3_uploads/docs/",
+    "build:status": "node ./scripts/build-status.mjs",
+    "dist": "npm run clean && npm run build && npm run build:docs && copyfiles -u 1 \"dist/**/*\" .s3_uploads/",
+    "watch:build": "nodemon --watch \"./src/*\" --exec \"node ./scripts/build.mts --dev\" -e ts,js,vert,frag,wgsl,d.ts --ignore \"index.ts\"",
+    "watch:lib": "nodemon --watch \"./src/*\" --exec \"npm run build:status start && node ./scripts/build.mts --lib --dev && npm run build:status done\" -e ts,js,vert,frag,wgsl,d.ts --ignore \"index.ts\"",
+    "watch:docs": "http-server .s3_uploads/docs -p 8080 -c-1 & nodemon --watch \"./src/*\" --exec \"npm run build:docs\" -e ts,md",
+    "test": "node ./scripts/test.mts",
+    "test:visual": "node ./scripts/test.mts visual",
+    "test:unit": "node ./scripts/test.mts unit",
+    "test:types": "node ./scripts/test.mts types",
+    "test:dts": "node ./scripts/test.mts dts",
+    "test:lint": "node ./scripts/test.mts lint",
+    "lint": "node ./scripts/test.mts lint --fix",
+    "release": "node ./scripts/release.mts"
   },
-  "pre-commit": [
-    "lintfix"
-  ],
-  "engines": {
-    "node": ">=12",
-    "yarn": "please-use-npm",
-    "npm": ">=7"
+  "lint-staged": {
+    "!(src/**/index).{ts,js,mjs}": "eslint --cache --max-warnings 0 --fix"
   },
-  "nyc": {
-    "all": true,
-    "extends": "@istanbuljs/nyc-config-typescript",
-    "include": [
-      "packages/**/src/**"
-    ],
-    "exclude": [
-      "packages/polyfill/src**"
-    ],
-    "report-dir": "dist/coverage"
+  "dependencies": {
+    "@pixi/colord": "^2.9.6",
+    "@types/earcut": "^3.0.0",
+    "@webgpu/types": "^0.1.69",
+    "@xmldom/xmldom": "^0.8.15",
+    "earcut": "^3.0.2",
+    "eventemitter3": "^5.0.1",
+    "gifuct-js": "^2.1.2",
+    "ismobilejs": "^1.1.1",
+    "parse-svg-path": "^0.2.0",
+    "tiny-lru": "^11.4.7"
   },
   "devDependencies": {
-    "@istanbuljs/nyc-config-typescript": "^1.0.1",
-    "@microsoft/api-extractor": "~7.20.1",
-    "@pixi-build-tools/api-extractor-lerna-monorepo": "~1.1.0",
-    "@pixi/eslint-config": "^2.0.1",
-    "@pixi/webdoc-template": "^1.5.3",
-    "@rollup/plugin-alias": "^3.1.1",
-    "@rollup/plugin-buble": "^0.21.3",
-    "@rollup/plugin-commonjs": "^15.1.0",
-    "@rollup/plugin-json": "^4.1.0",
-    "@rollup/plugin-node-resolve": "^9.0.0",
-    "@rollup/plugin-typescript": "^6.0.0",
-    "@types/mocha": "^8.2.3",
-    "@webdoc/cli": "^1.5.5",
-    "chai": "~4.3.6",
-    "copyfiles": "^2.1.0",
-    "cross-env": "^5.2.0",
-    "electron": "^12.0.0",
-    "eslint": "^7.2.0",
-    "floss": "^5.0.0",
-    "glob": "^7.1.3",
-    "lerna": "^4.0.0",
-    "npm-run-all": "^4.1.5",
-    "nyc": "^15.1.0",
-    "pre-commit": "^1.2.2",
-    "rimraf": "^2.6.3",
-    "rollup": "^2.70.1",
+    "@babel/core": "7.28.6",
+    "@babel/plugin-transform-modules-commonjs": "^7.28.6",
+    "@pixi/eslint-config": "^6.0.0",
+    "@pixi/jest-electron": "^26.1.0",
+    "@pixi/webworker-plugins": "^1.0.1",
+    "@rollup/plugin-alias": "^6.0.0",
+    "@rollup/plugin-commonjs": "^29.0.0",
+    "@rollup/plugin-json": "^6.1.0",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@types/fs-extra": "^11.0.4",
+    "@types/glob": "^8.1.0",
+    "@types/jest": "^26.0.0",
+    "@types/pixelmatch": "^5.2.6",
+    "@types/pngjs": "^6.0.5",
+    "@types/semver": "^7.7.1",
+    "babel-jest": "^26.0.0",
+    "copyfiles": "^2.4.1",
+    "dts-bundle-generator": "^9.5.1",
+    "esbuild": "^0.27.2",
+    "eslint": "^9.39.2",
+    "eslint-plugin-jest": "^29.5.0",
+    "eslint-plugin-jsdoc": "^62.0.0",
+    "eslint-plugin-no-mixed-operators": "^1.1.1",
+    "expect-type": "^1.3.0",
+    "fs-extra": "^11.3.3",
+    "get-port": "^7.1.0",
+    "glob": "^8.1.0",
+    "http-server": "^14.1.1",
+    "husky": "^8.0.3",
+    "inquirer": "^13.2.0",
+    "jest": "^26.0.0",
+    "jest-extended": "^1.2.1",
+    "jest-raw-loader": "^1.0.1",
+    "knip": "^5.81.0",
+    "lint-staged": "^16.2.7",
+    "nodemon": "^3.1.11",
+    "pixelmatch": "^5.3.0",
+    "pkg-pr-new": "^0.0.65",
+    "pngjs": "^7.0.0",
+    "rimraf": "^6.1.2",
+    "rollup": "^4.55.1",
+    "rollup-plugin-esbuild": "^6.2.1",
+    "rollup-plugin-external-globals": "^0.13.0",
     "rollup-plugin-jscc": "^2.0.0",
-    "rollup-plugin-sourcemaps": "^0.4.2",
+    "rollup-plugin-sourcemaps": "^0.6.3",
     "rollup-plugin-string": "^3.0.0",
-    "rollup-plugin-terser": "^7.0.2",
-    "rollup-plugin-typescript": "^1.0.1",
-    "sinon": "^7.3.2",
-    "sinon-chai": "^3.3.0",
-    "ts-node": "^9.0.0",
-    "tsconfig-paths": "^3.10.1",
-    "typescript": "~4.3.0",
-    "workspaces-run": "^1.0.1"
+    "semver": "^7.6.3",
+    "tree-kill": "^1.2.2",
+    "ts-jest": "^26.0.0",
+    "typedoc": "^0.28.20",
+    "typedoc-plugin-ga": "^1.1.1",
+    "typedoc-plugin-markdown": "^4.9.0",
+    "typedoc-plugin-mdn-links": "^5.0.10",
+    "typedoc-plugin-no-inherit": "^1.6.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.67.0"
+  },
+  "bundles": [
+    {
+      "src": "src/bundle.browser.ts",
+      "target": "dist/pixi.js",
+      "module": "dist/pixi.mjs",
+      "plugin": false
+    },
+    {
+      "src": "src/bundle.math-extras.ts",
+      "target": "dist/packages/math-extras.js",
+      "module": "dist/packages/math-extras.mjs",
+      "plugin": [
+        "/maths/"
+      ]
+    },
+    {
+      "src": "src/bundle.unsafe-eval.ts",
+      "target": "dist/packages/unsafe-eval.js",
+      "module": "dist/packages/unsafe-eval.mjs",
+      "plugin": [
+        "/rendering/"
+      ]
+    },
+    {
+      "src": "src/bundle.advanced-blend-modes.ts",
+      "target": "dist/packages/advanced-blend-modes.js",
+      "module": "dist/packages/advanced-blend-modes.mjs",
+      "plugin": [
+        "/rendering/",
+        "/extensions/",
+        "/filters/"
+      ]
+    },
+    {
+      "src": "src/bundle.gif.ts",
+      "target": "dist/packages/gif.js",
+      "module": "dist/packages/gif.mjs",
+      "plugin": [
+        "/utils/",
+        "/assets/",
+        "/ticker/",
+        "/environment/",
+        "/scene/",
+        "/rendering/",
+        "/extensions/"
+      ]
+    },
+    {
+      "src": "src/bundle.html-source.ts",
+      "target": "dist/packages/html-source.js",
+      "module": "dist/packages/html-source.mjs",
+      "plugin": [
+        "/rendering/",
+        "/extensions/"
+      ]
+    },
+    {
+      "src": "src/bundle.webworker.ts",
+      "target": "dist/webworker.js",
+      "module": "dist/webworker.mjs",
+      "plugin": false
+    }
+  ],
+  "sideEffects": [
+    "./lib/environment-browser/browserAll.*",
+    "./lib/environment-webworker/webworkerAll.*",
+    "./lib/index.*",
+    "./lib/rendering/init.*",
+    "./lib/spritesheet/init.*",
+    "./lib/rendering/renderers/shared/texture/utils/textureFrom.*",
+    "./lib/gif/init.*",
+    "./lib/html-source/init.*",
+    "./lib/accessibility/init.*",
+    "./lib/advanced-blend-modes/init.*",
+    "./lib/app/init.*",
+    "./lib/compressed-textures/dds/init.*",
+    "./lib/compressed-textures/ktx/init.*",
+    "./lib/compressed-textures/ktx2/init.*",
+    "./lib/compressed-textures/basis/init.*",
+    "./lib/events/init.*",
+    "./lib/dom/init.*",
+    "./lib/filters/init.*",
+    "./lib/math-extras/init.*",
+    "./lib/scene/sprite-tiling/init.*",
+    "./lib/scene/text/init.*",
+    "./lib/scene/text-bitmap/init.*",
+    "./lib/scene/text-html/init.*",
+    "./lib/scene/graphics/init.*",
+    "./lib/scene/mesh/init.*",
+    "./lib/prepare/init.*",
+    "./lib/unsafe-eval/init.*",
+    "./lib/scene/sprite-nine-slice/init.*",
+    "./lib/scene/particle-container/init.*"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types@<6.0": "./lib/index.legacy.d.ts",
+        "types": "./lib/index.d.ts",
+        "default": "./lib/index.mjs"
+      },
+      "require": {
+        "types@<6.0": "./lib/index.legacy.d.ts",
+        "types": "./lib/index.d.ts",
+        "default": "./lib/index.js"
+      }
+    },
+    "./browser": {
+      "import": {
+        "default": "./lib/environment-browser/browserAll.mjs"
+      },
+      "require": {
+        "default": "./lib/environment-browser/browserAll.js"
+      }
+    },
+    "./webworker": {
+      "import": {
+        "default": "./lib/environment-webworker/webworkerAll.mjs"
+      },
+      "require": {
+        "default": "./lib/environment-webworker/webworkerAll.js"
+      }
+    },
+    "./gif": {
+      "import": {
+        "types@<6.0": "./lib/gif/init.legacy.d.ts",
+        "types": "./lib/gif/init.d.ts",
+        "default": "./lib/gif/init.mjs"
+      },
+      "require": {
+        "types@<6.0": "./lib/gif/init.legacy.d.ts",
+        "types": "./lib/gif/init.d.ts",
+        "default": "./lib/gif/init.js"
+      }
+    },
+    "./html-source": {
+      "import": {
+        "types@<6.0": "./lib/html-source/init.legacy.d.ts",
+        "types": "./lib/html-source/init.d.ts",
+        "default": "./lib/html-source/init.mjs"
+      },
+      "require": {
+        "types@<6.0": "./lib/html-source/init.legacy.d.ts",
+        "types": "./lib/html-source/init.d.ts",
+        "default": "./lib/html-source/init.js"
+      }
+    },
+    "./accessibility": {
+      "import": {
+        "default": "./lib/accessibility/init.mjs"
+      },
+      "require": {
+        "default": "./lib/accessibility/init.js"
+      }
+    },
+    "./advanced-blend-modes": {
+      "import": {
+        "default": "./lib/advanced-blend-modes/init.mjs"
+      },
+      "require": {
+        "default": "./lib/advanced-blend-modes/init.js"
+      }
+    },
+    "./app": {
+      "import": {
+        "default": "./lib/app/init.mjs"
+      },
+      "require": {
+        "default": "./lib/app/init.js"
+      }
+    },
+    "./dds": {
+      "import": {
+        "default": "./lib/compressed-textures/dds/init.mjs"
+      },
+      "require": {
+        "default": "./lib/compressed-textures/dds/init.js"
+      }
+    },
+    "./ktx": {
+      "import": {
+        "default": "./lib/compressed-textures/ktx/init.mjs"
+      },
+      "require": {
+        "default": "./lib/compressed-textures/ktx/init.js"
+      }
+    },
+    "./ktx2": {
+      "import": {
+        "default": "./lib/compressed-textures/ktx2/init.mjs"
+      },
+      "require": {
+        "default": "./lib/compressed-textures/ktx2/init.js"
+      }
+    },
+    "./basis": {
+      "import": {
+        "default": "./lib/compressed-textures/basis/init.mjs"
+      },
+      "require": {
+        "default": "./lib/compressed-textures/basis/init.js"
+      }
+    },
+    "./events": {
+      "import": {
+        "default": "./lib/events/init.mjs"
+      },
+      "require": {
+        "default": "./lib/events/init.js"
+      }
+    },
+    "./dom": {
+      "import": {
+        "default": "./lib/dom/init.mjs"
+      },
+      "require": {
+        "default": "./lib/dom/init.js"
+      }
+    },
+    "./filters": {
+      "import": {
+        "default": "./lib/filters/init.mjs"
+      },
+      "require": {
+        "default": "./lib/filters/init.js"
+      }
+    },
+    "./math-extras": {
+      "import": {
+        "default": "./lib/math-extras/init.mjs"
+      },
+      "require": {
+        "default": "./lib/math-extras/init.js"
+      }
+    },
+    "./sprite-tiling": {
+      "import": {
+        "default": "./lib/scene/sprite-tiling/init.mjs"
+      },
+      "require": {
+        "default": "./lib/scene/sprite-tiling/init.js"
+      }
+    },
+    "./text": {
+      "import": {
+        "default": "./lib/scene/text/init.mjs"
+      },
+      "require": {
+        "default": "./lib/scene/text/init.js"
+      }
+    },
+    "./text-bitmap": {
+      "import": {
+        "default": "./lib/scene/text-bitmap/init.mjs"
+      },
+      "require": {
+        "default": "./lib/scene/text-bitmap/init.js"
+      }
+    },
+    "./text-html": {
+      "import": {
+        "default": "./lib/scene/text-html/init.mjs"
+      },
+      "require": {
+        "default": "./lib/scene/text-html/init.js"
+      }
+    },
+    "./graphics": {
+      "import": {
+        "default": "./lib/scene/graphics/init.mjs"
+      },
+      "require": {
+        "default": "./lib/scene/graphics/init.js"
+      }
+    },
+    "./mesh": {
+      "import": {
+        "default": "./lib/scene/mesh/init.mjs"
+      },
+      "require": {
+        "default": "./lib/scene/mesh/init.js"
+      }
+    },
+    "./prepare": {
+      "import": {
+        "default": "./lib/prepare/init.mjs"
+      },
+      "require": {
+        "default": "./lib/prepare/init.js"
+      }
+    },
+    "./unsafe-eval": {
+      "import": {
+        "default": "./lib/unsafe-eval/init.mjs"
+      },
+      "require": {
+        "default": "./lib/unsafe-eval/init.js"
+      }
+    },
+    "./sprite-nine-slice": {
+      "import": {
+        "default": "./lib/scene/sprite-nine-slice/init.mjs"
+      },
+      "require": {
+        "default": "./lib/scene/sprite-nine-slice/init.js"
+      }
+    },
+    "./particle-container": {
+      "import": {
+        "default": "./lib/scene/particle-container/init.mjs"
+      },
+      "require": {
+        "default": "./lib/scene/particle-container/init.js"
+      }
+    }
   }
 }

@@ -11,6 +11,7 @@ Thumbs.db
 Desktop.ini
 npm-debug.log
 lerna-debug.log
+.eslintcache
 
 # project files
 .project
@@ -31,15 +32,13 @@ coverage
 coverage.lcov
 .nyc_output
 dist
-bundles/*/*.d.ts
+lib
 out
-packages/**/index.d.ts
 
 # jetBrains IDE ignores
 .idea
 
 # VSCode ignores
-.vscode
 pixi.code-workspace
 
 # IntelliJ
@@ -47,3 +46,19 @@ pixi.code-workspace
 
 # webdoc api
 dist/docs/pixi.api.json
+
+# A folder that will be uploaded with every PR
+# This is useful for things like visual testing artifacts that can be used to debug a PR if it fails
+.pr_uploads
+
+# A folder that will be uploaded with every release
+# This is useful for things like docs and bundled versions of the library
+.s3_uploads
+
+# Build status (for playground)
+.build-status.json
+
+# Playground
+playground/node_modules/
+playground/src/*.playground.ts
+!playground/src/default.playground.ts

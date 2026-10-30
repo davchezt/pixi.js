@@ -1,0 +1,18 @@
+/* eslint-disable no-restricted-globals */
+import type { RenderTarget } from './RenderTarget';
+
+/**
+ * Checks if the render target is viewable on the screen
+ * Basically, is it a canvas element and is that canvas element in the DOM
+ * @param renderTarget - the render target to check
+ * @returns true if the render target is viewable on the screen
+ * @internal
+ */
+export function isRenderingToScreen(renderTarget: RenderTarget): boolean
+{
+    if (renderTarget.colorAttachments.length === 0) return false;
+
+    const resource = renderTarget.colorTexture.resource;
+
+    return ((globalThis.HTMLCanvasElement && resource instanceof HTMLCanvasElement) && document.body.contains(resource));
+}

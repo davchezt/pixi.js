@@ -1,0 +1,200 @@
+import { ExtensionType } from '../../../extensions/Extensions';
+import { CLEAR } from '../../renderers/gl/const';
+import { STENCIL_MODES } from '../../renderers/shared/state/const';
+
+import type { Container } from '../../../scene/container/Container';
+import type { Effect } from '../../../scene/container/Effect';
+import type { WebGLRenderer } from '../../renderers/gl/WebGLRenderer';
+import type { WebGPURenderer } from '../../renderers/gpu/WebGPURenderer';
+import type { InstructionSet } from '../../renderers/shared/instructions/InstructionSet';
+import type { InstructionPipe } from '../../renderers/shared/instructions/RenderPipe';
+import type { Renderable } from '../../renderers/shared/Renderable';
+import type { Renderer } from '../../renderers/types';
+import type { StencilMask } from './StencilMask';
+import type { StencilMaskInstruction } from './StencilMaskTypes';
+
+/** @internal */
+export class StencilMaskPipe implements InstructionPipe<StencilMaskInstruction>
+{
+    public static extension = {
+        type: [
+            ExtensionType.WebGLPipes,
+            ExtensionType.WebGPUPipes,
+        ],
+        name: 'stencilMask',
+    } as const;
+
+    private _renderer: Renderer;
+
+    private _maskHash = new WeakMap<StencilMask, {
+        instructionsStart: number,
+        instructionsLength: number,
+    }>();
+
+    constructor(renderer: Renderer)
+    {
+        this._renderer = renderer;
+    }
+
+    public push(mask: Effect, _container: Container, instructionSet: InstructionSet): void
+    {
+        const effect = mask as StencilMask;
+
+        const renderer = this._renderer;
+
+        renderer.renderPipes.batch.break(instructionSet);
+
+        renderer.renderPipes.blendMode.setBlendMode(effect.mask as Renderable, 'none', instructionSet);
+
+        instructionSet.add({
+            renderPipeId: 'stencilMask',
+            action: 'pushMaskBegin',
+            mask,
+            inverse: _container._maskOptions.inverse,
+            canBundle: false,
+        } as StencilMaskInstruction);
+
+        const maskContainer = effect.mask;
+
+        maskContainer.includeInBuild = true;
+
+        if (!this._maskHash.has(effect))
+        {
+            this._maskHash.set(effect, {
+                instructionsStart: 0,
+                instructionsLength: 0,
+            });
+        }
+
+        const maskData = this._maskHash.get(effect);
+
+        maskData.instructionsStart = instructionSet.instructionSize;
+
+        maskContainer.collectRenderables(
+            instructionSet,
+            renderer,
+            null
+        );
+
+        maskContainer.includeInBuild = false;
+
+        renderer.renderPipes.batch.break(instructionSet);
+
+        instructionSet.add({
+            renderPipeId: 'stencilMask',
+            action: 'pushMaskEnd',
+            mask,
+            inverse: _container._maskOptions.inverse,
+            canBundle: false,
+        } as StencilMaskInstruction);
+
+        const instructionsLength = instructionSet.instructionSize - maskData.instructionsStart - 1;
+
+        maskData.instructionsLength = instructionsLength;
+    }
+
+    public pop(mask: Effect, _container: Container, instructionSet: InstructionSet): void
+    {
+        const effect = mask as StencilMask;
+
+        const renderer = this._renderer;
+
+        // stencil is stored based on current render target..
+        renderer.renderPipes.batch.break(instructionSet);
+        renderer.renderPipes.blendMode.setBlendMode(effect.mask as Renderable, 'none', instructionSet);
+
+        instructionSet.add({
+            renderPipeId: 'stencilMask',
+            action: 'popMaskBegin',
+            inverse: _container._maskOptions.inverse,
+            canBundle: false,
+        } as StencilMaskInstruction);
+
+        const maskData = this._maskHash.get(mask as StencilMask);
+
+        for (let i = 0; i < maskData.instructionsLength; i++)
+        {
+            // eslint-disable-next-line max-len
+            instructionSet.instructions[instructionSet.instructionSize++] = instructionSet.instructions[maskData.instructionsStart++];
+        }
+
+        instructionSet.add({
+            renderPipeId: 'stencilMask',
+            action: 'popMaskEnd',
+            canBundle: false,
+        });
+    }
+
+    public execute(instruction: StencilMaskInstruction)
+    {
+        const renderer = this._renderer;
+
+        const gpuRenderer = renderer as WebGLRenderer | WebGPURenderer;
+        const gpuRenderTarget = gpuRenderer.renderTarget.getGpuRenderTarget(gpuRenderer.renderTarget.renderTarget);
+
+        let maskStackIndex = gpuRenderTarget.maskStackIndex;
+
+        if (instruction.action === 'pushMaskBegin')
+        {
+            // we create the depth and stencil buffers JIT
+            // as no point allocating the memory if we don't use it
+            gpuRenderer.renderTarget.ensureDepthStencil();
+
+            gpuRenderer.stencil.setStencilMode(STENCIL_MODES.RENDERING_MASK_ADD, maskStackIndex);
+
+            maskStackIndex++;
+
+            gpuRenderer.colorMask.setMask(0);
+        }
+        else if (instruction.action === 'pushMaskEnd')
+        {
+            if (instruction.inverse)
+            {
+                gpuRenderer.stencil.setStencilMode(STENCIL_MODES.INVERSE_MASK_ACTIVE, maskStackIndex);
+            }
+            else
+            {
+                gpuRenderer.stencil.setStencilMode(STENCIL_MODES.MASK_ACTIVE, maskStackIndex);
+            }
+
+            gpuRenderer.colorMask.setMask(0xF);
+        }
+        else if (instruction.action === 'popMaskBegin')
+        {
+            gpuRenderer.colorMask.setMask(0);
+
+            if (maskStackIndex !== 0)
+            {
+                gpuRenderer.stencil.setStencilMode(STENCIL_MODES.RENDERING_MASK_REMOVE, maskStackIndex);
+            }
+            else
+            {
+                gpuRenderer.renderTarget.clear(null, CLEAR.STENCIL);
+                gpuRenderer.stencil.setStencilMode(STENCIL_MODES.DISABLED, maskStackIndex);
+            }
+
+            maskStackIndex--;
+        }
+        else if (instruction.action === 'popMaskEnd')
+        {
+            if (instruction.inverse)
+            {
+                gpuRenderer.stencil.setStencilMode(STENCIL_MODES.INVERSE_MASK_ACTIVE, maskStackIndex);
+            }
+            else
+            {
+                gpuRenderer.stencil.setStencilMode(STENCIL_MODES.MASK_ACTIVE, maskStackIndex);
+            }
+
+            gpuRenderer.colorMask.setMask(0xF);
+        }
+
+        gpuRenderTarget.maskStackIndex = maskStackIndex;
+    }
+
+    public destroy()
+    {
+        this._renderer = null;
+        this._maskHash = null;
+    }
+}
